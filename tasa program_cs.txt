@@ -1,0 +1,1013 @@
+using System;
+using System.Collections.Generic;
+using SAPbouiCOM.Framework;
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+using SAPbobsCOM;
+using HtmlAgilityPack;
+using System.Net.Mail;
+using System.Net;
+using SAPbouiCOM;
+using Application = SAPbouiCOM.Framework.Application;
+using System.Windows.Forms;
+using static System.Windows.Forms.AxHost;
+using Microsoft.Extensions.Configuration;
+using System.Linq;
+using static System.Runtime.CompilerServices.RuntimeHelpers;
+using static System.Net.Mime.MediaTypeNames;
+
+
+namespace SBO_ExchangeRatBCV
+{
+    class Program
+    {
+
+        public static SAPbobsCOM.Company mySBOCompany = new SAPbobsCOM.Company();
+        public static SAPbobsCOM.Recordset myRecorset = null;
+        public static IConfigurationRoot configuration;
+        public static List<Intercompany> IntercompanyList;
+
+        /// <summary>
+        /// The main entry point for the application.
+        /// </summary>
+        [STAThread]
+        static void Main(string[] args)
+        {
+            try
+            {
+                Application oApp = null;
+                if (args.Length < 1)
+                {
+                    oApp = new Application();
+                }
+                else
+                {
+                    oApp = new Application(args[0]);
+                }
+
+                mySBOCompany = (SAPbobsCOM.Company)Application.SBO_Application.Company.GetDICompany();// Asigna a la variable ocompany los datos de la conexion que ya esta hecha en sb1
+
+
+                //Menu MyMenu = new Menu();
+                //MyMenu.AddMenuItems();
+                //oApp.RegisterMenuEventHandler(MyMenu.SBO_Application_MenuEvent);
+                Application.SBO_Application.AppEvent += new SAPbouiCOM._IApplicationEvents_AppEventEventHandler(SBO_Application_AppEvent);
+                Application.SBO_Application.ItemEvent += new SAPbouiCOM._IApplicationEvents_ItemEventEventHandler(SBO_Application_ItemEvent);
+               
+                // llamado de la funcion
+
+
+                oApp.Run();
+            }
+            catch (Exception ex)
+            {
+                System.Windows.Forms.MessageBox.Show(ex.Message);
+            }
+        }
+
+        public static void SBO_Application_ItemEvent(string FormUID, ref ItemEvent pVal, out bool BubbleEvent)
+        {
+            BubbleEvent = true;
+
+            if (pVal.FormTypeEx == "426" && // Formulario de pagosc
+    pVal.EventType == BoEventTypes.et_ITEM_PRESSED &&
+    pVal.ItemUID == "1" && // Botón "Agregar"
+    !pVal.BeforeAction && // Después de guardar
+    pVal.ActionSuccess)
+            {
+                SAPbouiCOM.Form oForm = Application.SBO_Application.Forms.Item(pVal.FormUID);
+
+                if (oForm.Mode == SAPbouiCOM.BoFormMode.fm_ADD_MODE)
+                {
+                    try
+                    {
+
+                        string docEntry = string.Empty;
+
+                        string BankAccount = string.Empty;
+
+                        myRecorset = null;
+
+                        myRecorset = (SAPbobsCOM.Recordset)mySBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+
+                        // Obtener el ID del usuario actual
+                        int userId = mySBOCompany.UserSignature;
+
+                        // Consulta segura
+                        string sql = $@"SELECT TOP 1 DocEntry, U_CNX_Intercompany FROM OVPM WHERE UserSign = {userId} ORDER BY DocEntry DESC";
+
+                        myRecorset.DoQuery(sql);
+
+                        if (!myRecorset.EoF)
+                        {
+                            docEntry = myRecorset.Fields.Item("DocEntry").Value.ToString();
+
+                            BankAccount = myRecorset.Fields.Item("U_CNX_Intercompany").Value.ToString();
+
+                            if (!String.IsNullOrWhiteSpace(docEntry))
+                            {
+                                if (!String.IsNullOrWhiteSpace(BankAccount))
+                                {
+                                    CrearPagoIntercompany(Convert.ToInt32(docEntry), BankAccount);
+                                }
+
+
+                            }
+
+                        }
+                        else
+                        {
+                            Application.SBO_Application.StatusBar.SetText("No se encontró ningún pago reciente", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
+                        }
+
+
+                    }
+                    catch (Exception ex)
+                    {
+                        Application.SBO_Application.StatusBar.SetText("Error en evento de pago: " + mySBOCompany.GetLastErrorDescription(), SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Error);
+
+                    }
+
+                }
+
+
+
+            }
+
+            if (pVal.FormTypeEx == "392" && // Formulario de Asientos
+    pVal.EventType == BoEventTypes.et_ITEM_PRESSED &&
+    pVal.ItemUID == "1" && // Botón "Agregar"
+    !pVal.BeforeAction && // Después de guardar
+    pVal.ActionSuccess)
+            {
+                SAPbouiCOM.Form oForm = Application.SBO_Application.Forms.Item(pVal.FormUID);
+
+                if (oForm.Mode == SAPbouiCOM.BoFormMode.fm_ADD_MODE)
+                {
+                    try
+                    {
+
+                        string TransId = string.Empty;
+
+                        string BankAccount = string.Empty;
+
+                        myRecorset = null;
+
+                        myRecorset = (SAPbobsCOM.Recordset)mySBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+
+                        // Obtener el ID del usuario actual
+                        int userId = mySBOCompany.UserSignature;
+
+                        // Consulta segura
+                        string sql = $@"SELECT TOP 1 TransId, U_CNX_Intercompany FROM OJDT WHERE UserSign = {userId} ORDER BY TransId DESC";
+
+                        myRecorset.DoQuery(sql);
+
+                        if (!myRecorset.EoF)
+                        {
+                            TransId = myRecorset.Fields.Item("TransId").Value.ToString();
+
+                            BankAccount = myRecorset.Fields.Item("U_CNX_Intercompany").Value.ToString();
+
+                            if (!String.IsNullOrWhiteSpace(TransId))
+                            {
+                                if (!String.IsNullOrWhiteSpace(BankAccount))
+                                {
+                                    CrearAsientoIntercompany(Convert.ToInt32(TransId), BankAccount);
+                                }
+
+
+                            }
+
+                        }
+                        else
+                        {
+                            Application.SBO_Application.StatusBar.SetText("No se encontró ningún asiento reciente", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
+                        }
+
+
+                    }
+                    catch (Exception ex)
+                    {
+                        Application.SBO_Application.StatusBar.SetText("Error en evento de asiento: " + mySBOCompany.GetLastErrorDescription(), SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Error);
+
+                    }
+
+                }
+
+
+
+
+            }
+        }
+
+        private static void CrearAsientoIntercompany(int TransId, string BankAccount)
+        {
+            LoadIntercompanys();
+
+            SAPbobsCOM.JournalEntries oJE = (SAPbobsCOM.JournalEntries)mySBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oJournalEntries);
+            if (oJE.GetByKey(TransId))
+            {
+                string accountCode = null;
+
+                DateTime Date = DateTime.Now;
+
+                double Amount = 0;
+
+                double AmountFC = 0;
+
+                double AmountSC = 0;
+
+                string Currency = null;
+               
+                bool? sw = null;
+
+               
+                for (int i = 0; i < oJE.Lines.Count; i++)
+                {
+                    oJE.Lines.SetCurrentLine(i);                   
+
+                    var IntercompanyDestiny = IntercompanyList.FirstOrDefault(p => p.AccountCode == oJE.Lines.AccountCode);//CXP
+
+                    if(IntercompanyDestiny != null){
+
+                        accountCode = IntercompanyDestiny.AccountCode;
+
+                        sw = true;
+
+                        break;
+
+                    }
+
+                    var IntercompanyDestiny1 = IntercompanyList.FirstOrDefault(p => p.ReceivableAccount == oJE.Lines.AccountCode);//CXC
+
+                    if (IntercompanyDestiny1 != null)
+                    {
+                        accountCode = IntercompanyDestiny1.ReceivableAccount;
+
+                        sw = false;
+
+                        break;
+
+                    }
+
+
+                }
+
+                Intercompany IntercompanyDatabase = new Intercompany();
+
+
+                if (sw == true)
+                {
+                     IntercompanyDatabase = IntercompanyList.FirstOrDefault(p => p.AccountCode == accountCode); //CXP 
+                }
+                else if (sw == false)
+                {
+                     IntercompanyDatabase = IntercompanyList.FirstOrDefault(p => p.ReceivableAccount == accountCode); //CXC
+                }
+                                
+                if (IntercompanyDatabase != null)
+                {
+                    SAPbobsCOM.Company oTargetCompany = new SAPbobsCOM.Company();
+
+                    // Configura los parámetros de conexión
+                    oTargetCompany.Server = "sofcdba01";
+                    oTargetCompany.LicenseServer = "sofcsap01:30000";
+                    oTargetCompany.DbServerType = SAPbobsCOM.BoDataServerTypes.dst_MSSQL2016;
+                    oTargetCompany.CompanyDB = IntercompanyDatabase.Database;
+                    oTargetCompany.UserName = IntercompanyDatabase.UserName;
+                    oTargetCompany.Password = IntercompanyDatabase.Password;
+
+                    // Conectar
+                    int lRetCode = oTargetCompany.Connect();
+                    if (lRetCode != 0)
+                    {
+                        string errMsg;
+                        int errCode;
+                        oTargetCompany.GetLastError(out errCode, out errMsg);
+                        Application.SBO_Application.StatusBar.SetText("Error: " + errCode, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+                        return;
+
+                    }
+                    else
+                    {
+
+                        var IntercompanyOrigin = IntercompanyList.FirstOrDefault(p => p.Database == mySBOCompany.CompanyDB);
+
+                        SAPbobsCOM.JournalEntries oJEDestiny = (SAPbobsCOM.JournalEntries)oTargetCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oJournalEntries);
+
+                        oJEDestiny.ReferenceDate = oJE.ReferenceDate;
+                        oJEDestiny.Reference=TransId.ToString(); 
+                        oJEDestiny.DueDate = oJE.DueDate;
+                        oJEDestiny.TaxDate = oJE.TaxDate;                       
+                        oJEDestiny.Memo = oJE.Memo;
+
+                        //Revisar -------------------------------------------------------------------------------------------------------------------------
+
+
+                        //Obtener moneda del asiento de origen
+
+                        for (int i = 0; i < oJE.Lines.Count; i++)
+                        {
+                            oJE.Lines.SetCurrentLine(i);
+
+                            Currency = oJE.Lines.FCCurrency;
+
+                            if(Convert.ToDouble(oJE.Lines.Debit) > 0 && ((IntercompanyList.Any(c => c.AccountCode == oJE.Lines.AccountCode)) || (IntercompanyList.Any(c => c.ReceivableAccount == oJE.Lines.AccountCode))))
+                            {
+                                Amount = Convert.ToDouble(oJE.Lines.Debit);
+                            }
+
+                            else if (Convert.ToDouble(oJE.Lines.Credit) > 0 && ((IntercompanyList.Any(c => c.AccountCode == oJE.Lines.AccountCode)) || (IntercompanyList.Any(c => c.ReceivableAccount == oJE.Lines.AccountCode))))
+                            {
+                                Amount = Convert.ToDouble(oJE.Lines.Credit);
+                            }
+
+                            if (Convert.ToDouble(oJE.Lines.FCDebit) > 0 && ((IntercompanyList.Any(c => c.AccountCode == oJE.Lines.AccountCode)) || (IntercompanyList.Any(c => c.ReceivableAccount == oJE.Lines.AccountCode))))
+                            {
+                                AmountFC = Convert.ToDouble(oJE.Lines.FCDebit);
+                            }
+
+                            else if (Convert.ToDouble(oJE.Lines.FCCredit) > 0 && ((IntercompanyList.Any(c => c.AccountCode == oJE.Lines.AccountCode)) || (IntercompanyList.Any(c => c.ReceivableAccount == oJE.Lines.AccountCode))))
+                            {
+                                AmountFC = Convert.ToDouble(oJE.Lines.FCCredit);
+                            }
+
+                            if (Convert.ToDouble(oJE.Lines.DebitSys) > 0 && ((IntercompanyList.Any(c => c.AccountCode == oJE.Lines.AccountCode)) || (IntercompanyList.Any(c => c.ReceivableAccount == oJE.Lines.AccountCode))))
+                            {
+                                AmountSC = Convert.ToDouble(oJE.Lines.DebitSys);
+                            }
+
+                            else if (Convert.ToDouble(oJE.Lines.Credit) > 0 && ((IntercompanyList.Any(c => c.AccountCode == oJE.Lines.AccountCode)) || (IntercompanyList.Any(c => c.ReceivableAccount == oJE.Lines.AccountCode))))
+                            {
+                                AmountSC = Convert.ToDouble(oJE.Lines.CreditSys);
+                            }
+
+
+                        }
+
+
+                        if (String.IsNullOrWhiteSpace(Currency))//Registro en Bolivares
+                        {
+
+                            if (sw == true)//CXP
+                            {
+                                oJEDestiny.Lines.AccountCode = IntercompanyOrigin.ReceivableAccount; // Cuenta por cobrar intercompany
+                                oJEDestiny.Lines.Debit = Amount;
+                                oJEDestiny.Lines.DebitSys = AmountSC;
+                                oJEDestiny.Lines.Add();
+
+                                oJEDestiny.Lines.AccountCode = BankAccount; // Cuenta bancaria intercompany
+                                oJEDestiny.Lines.Credit = Amount;
+                                oJEDestiny.Lines.CreditSys = AmountSC;
+                                oJEDestiny.Lines.Add();
+
+                               
+
+                            }
+                            else if(sw==false) {//CXC
+
+                                oJEDestiny.Lines.AccountCode = BankAccount; // Cuenta bancaria intercompany
+                                oJEDestiny.Lines.Debit = Amount;
+                                oJEDestiny.Lines.DebitSys = AmountSC;
+                                oJEDestiny.Lines.Add();
+
+                                oJEDestiny.Lines.AccountCode = IntercompanyOrigin.AccountCode; // Cuenta por cobrar intercompany
+                                oJEDestiny.Lines.Credit = Amount;
+                                oJEDestiny.Lines.CreditSys = AmountSC;
+                                oJEDestiny.Lines.Add();
+                            }
+
+                        }
+                        else
+                        {
+
+                            if (sw == true)//CXP
+                            {
+                                oJEDestiny.Lines.FCCurrency = Currency;
+                                oJEDestiny.Lines.AccountCode = IntercompanyOrigin.ReceivableAccount; // Cuenta por cobrar intercompany
+                                oJEDestiny.Lines.Debit = Amount;
+                                oJEDestiny.Lines.DebitSys = AmountSC;
+                                oJEDestiny.Lines.FCDebit = AmountFC;
+                                oJEDestiny.Lines.Add();
+
+                                oJEDestiny.Lines.FCCurrency = Currency;
+                                oJEDestiny.Lines.AccountCode = BankAccount; // Cuenta bancaria intercompany
+                                oJEDestiny.Lines.Credit = Amount;
+                                oJEDestiny.Lines.CreditSys = AmountSC;
+                                oJEDestiny.Lines.FCCredit = AmountFC;
+                                oJEDestiny.Lines.Add();
+                            }
+                            else if (sw == false)
+                            {//CXC
+
+                                oJEDestiny.Lines.FCCurrency = Currency;
+                                oJEDestiny.Lines.AccountCode = BankAccount; // Cuenta bancaria intercompany                                
+                                oJEDestiny.Lines.FCDebit = AmountFC;
+                                oJEDestiny.Lines.Debit = Amount;
+                                oJEDestiny.Lines.DebitSys = AmountSC;
+                                oJEDestiny.Lines.Add();
+
+                                oJEDestiny.Lines.FCCurrency = Currency;
+                                oJEDestiny.Lines.AccountCode = IntercompanyOrigin.AccountCode; // Cuenta por cobrar intercompany
+                                oJEDestiny.Lines.FCCredit = AmountFC;                                
+                                oJEDestiny.Lines.Credit = Amount;
+                                oJEDestiny.Lines.CreditSys = AmountSC;
+                                oJEDestiny.Lines.Add();
+                            }
+                        }
+
+                        int res = oJEDestiny.Add();
+
+                        if (res != 0)
+                        {
+                            string errMsg;
+                            int errCode;
+                            oTargetCompany.GetLastError(out errCode, out errMsg);
+                            Application.SBO_Application.StatusBar.SetText("Error al crear el asiento: " + errCode + " " + errMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                            SAPbobsCOM.JournalEntries oCancelJE =
+    (SAPbobsCOM.JournalEntries)mySBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oJournalEntries);
+
+                            oCancelJE.Memo = "Reverso asiento " + TransId.ToString();
+                            oCancelJE.DueDate = oJE.DueDate;
+                            oCancelJE.TaxDate = oJE.DueDate;
+                            oCancelJE.VatDate = oJE.DueDate;
+                            oCancelJE.ReferenceDate = DateTime.Now;
+
+                            
+
+                            for (int i = 0; i < oJE.Lines.Count; i++)
+                            {
+                                oJE.Lines.SetCurrentLine(i);
+
+                                
+                                
+
+                                oCancelJE.Lines.AccountCode = oJE.Lines.AccountCode;
+                                oCancelJE.Lines.LineMemo = "Reverso asiento " + TransId.ToString();
+
+                                if (oJE.Lines.FCCurrency !=null)
+                                {
+                                    oCancelJE.Lines.Debit = oJE.Lines.Credit;
+                                    oCancelJE.Lines.Credit = oJE.Lines.Debit;
+                                    oCancelJE.Lines.DebitSys= oJE.Lines.CreditSys;
+                                    oCancelJE.Lines.CreditSys = oJE.Lines.DebitSys;
+                                    oCancelJE.Lines.Add();
+                                }
+                                // Si la línea está en moneda extranjera
+                                else
+                                {
+                                    oCancelJE.Lines.FCCurrency = oJE.Lines.FCCurrency; // mantener la moneda original
+                                    oCancelJE.Lines.Debit = oJE.Lines.Credit;
+                                    oCancelJE.Lines.Credit = oJE.Lines.Debit;
+
+                                    oCancelJE.Lines.DebitSys = oJE.Lines.CreditSys;
+                                    oCancelJE.Lines.CreditSys = oJE.Lines.DebitSys;
+                                    // si aplica moneda secundaria
+                                    oCancelJE.Lines.FCDebit = oJE.Lines.FCCredit;
+                                    oCancelJE.Lines.FCCredit = oJE.Lines.FCDebit;
+                                    oCancelJE.Lines.Add();
+                                }
+                            }
+
+
+                            int result = oCancelJE.Add();
+
+                            if (result != 0)
+                            {
+                                errMsg = "";
+                                mySBOCompany.GetLastError(out result, out errMsg);
+                                Application.SBO_Application.StatusBar.SetText("Error al cancelar el asiento: " + oJE.JdtNum + " " + errCode + " " + errMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                            }
+                            else
+                            {
+                                Application.SBO_Application.StatusBar.SetText("Asiento: " + oJE.JdtNum + " cancelado correctamente", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
+
+                            }
+
+
+
+                        }
+                        else
+                        {
+                            Application.SBO_Application.StatusBar.SetText("Asiento de intercompany hacia " + IntercompanyDatabase.Enterprise + " creado exitosamente en base destino.", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+
+                        }
+                    }
+
+
+                }
+                else
+                {
+                    Application.SBO_Application.StatusBar.SetText("Error: No se encontro datos de intercompañia", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                }
+
+
+
+            }
+        }
+
+        private static void LoadIntercompanys()
+        {
+
+            IntercompanyList = new List<Intercompany>();
+
+            Intercompany Intercompany1 = new Intercompany();
+
+            Intercompany1.Database = "SBO_SASO_LIVE";
+            Intercompany1.Enterprise = "SALAS DE SONIDO Y VISION, C.A.";
+            Intercompany1.UserName = "manager";
+            Intercompany1.Password = "B1Admin=";
+            Intercompany1.AccountCode = "2120100301";
+            Intercompany1.ReceivableAccount = "1120100301";
+
+            IntercompanyList.Add(Intercompany1);
+
+            Intercompany Intercompany2 = new Intercompany();
+
+
+            Intercompany2.Database = "SBO_SURA_LIVE";
+            Intercompany2.Enterprise = "SURAMERICANA DE ESPECTACULOS, S.A.";
+            Intercompany2.UserName = "manager";
+            Intercompany2.Password = "B1Admin=";
+            Intercompany2.AccountCode = "2120100302";
+            Intercompany2.ReceivableAccount = "1120100302";
+
+            IntercompanyList.Add(Intercompany2);
+
+            Intercompany Intercompany3 = new Intercompany();
+                        
+            Intercompany3.Database = "SBO_TOLON_LIVE";
+            Intercompany3.Enterprise = "CINEX TOLON, C.A.";
+            Intercompany3.UserName = "manager";
+            Intercompany3.Password = "B1Admin=";
+            Intercompany3.AccountCode = "2120100303";
+            Intercompany3.ReceivableAccount = "1120100303";
+
+            IntercompanyList.Add(Intercompany3);
+
+            Intercompany Intercompany4 = new Intercompany();
+
+            Intercompany4.Database = "SBO_MAIQUETIA_LIVES";
+            Intercompany4.Enterprise = "CINEX MAIQUETIA, C.A.";
+            Intercompany4.UserName = "manager";
+            Intercompany4.Password = "B1Admin=";
+            Intercompany4.AccountCode = "2120100304";
+            Intercompany4.ReceivableAccount = "1120100304";
+
+            IntercompanyList.Add(Intercompany4);
+
+            Intercompany Intercompany5 = new Intercompany();
+
+            Intercompany5.Database = "SBO_MAYDARD_LIVE";
+            Intercompany5.Enterprise = "INVERSIONES MAYDARD, C.A.";
+            Intercompany5.UserName = "manager";
+            Intercompany5.Password = "B1Admin=";
+            Intercompany5.AccountCode = "2120100305";
+            Intercompany5.ReceivableAccount = "1120100305";
+
+            IntercompanyList.Add(Intercompany5);
+
+
+            Intercompany Intercompany6 = new Intercompany();
+
+            Intercompany6.Database = "SBO_CFXY_LIVE";
+            Intercompany6.Enterprise = "CORPORACIONE FRANQUICIAS E INVERSIONES DE VZLA XY, C.A.";
+            Intercompany6.UserName = "manager";
+            Intercompany6.Password = "B1Admin=";
+            Intercompany6.AccountCode = "2120100306";
+            Intercompany6.ReceivableAccount = "1120100306";
+
+            IntercompanyList.Add(Intercompany6);
+
+            Intercompany Intercompany7 = new Intercompany();
+
+            Intercompany7.Database = "SBO_DARMAY_LIVE";
+            Intercompany7.Enterprise = "ADMINISTRADORA DARMAY, C.A.";
+            Intercompany7.UserName = "manager";
+            Intercompany7.Password = "B1Admin=";
+            Intercompany7.AccountCode = "2120100307";
+            Intercompany7.ReceivableAccount = "1120100307";
+
+            IntercompanyList.Add(Intercompany7);
+
+        }
+
+        public static string Truncar(string valor, int longitud)
+        {
+
+            if (string.IsNullOrEmpty(valor)) return valor; return valor.Length > longitud ? valor.Substring(0, longitud) : valor;
+        }
+        private static void CrearPagoIntercompany(int DocEntry, string BankAccount)
+        {
+
+            SAPbobsCOM.Payments oPayment = (SAPbobsCOM.Payments)mySBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oVendorPayments);
+
+            SAPbobsCOM.Company oTargetCompany = null;
+
+            try
+            {
+                LoadIntercompanys();                
+
+                if (oPayment.GetByKey(DocEntry))
+                {
+                    string accountCode = null;
+
+                    DateTime Date = DateTime.Now;
+
+                    double Amount = 0;
+
+                    string Currency = null;
+
+                    double Rate = 0;
+
+                    if (!String.IsNullOrWhiteSpace(oPayment.CashAccount))
+                    {
+                        accountCode = oPayment.CashAccount;
+                        Date = oPayment.DocDate;
+
+                        if (!String.IsNullOrWhiteSpace(oPayment.DocCurrency) && oPayment.DocCurrency != "VES")
+                        {
+                            Amount = oPayment.CashSum;
+                            Currency = oPayment.DocCurrency;
+                            Rate = oPayment.DocRate;
+                        }
+                        else
+                        {
+                            Amount = oPayment.CashSum;
+                            Currency = "VES";
+                            Rate = 0;
+                        }
+
+
+
+                    }
+                    else if (!String.IsNullOrWhiteSpace(oPayment.TransferAccount))
+                    {
+                        accountCode = oPayment.TransferAccount;
+                        Date = oPayment.DocDate;
+
+                        if (!String.IsNullOrWhiteSpace(oPayment.DocCurrency) && oPayment.DocCurrency != "VES")
+                        {
+                            Amount = oPayment.TransferSum;
+                            Currency = oPayment.DocCurrency;
+                            Rate = oPayment.DocRate;
+                        }
+                        else
+                        {
+                            Amount = oPayment.TransferSum;
+                            Currency = "VES";
+                            Rate = 0;
+                        }
+
+
+
+                    }
+                    else if (!String.IsNullOrWhiteSpace(oPayment.CheckAccount))
+                    {
+                        accountCode = oPayment.CheckAccount;
+                        Date = oPayment.DocDate;
+
+                        if (!String.IsNullOrWhiteSpace(oPayment.DocCurrency) && oPayment.DocCurrency != "VES")
+                        {
+                            Amount = oPayment.Checks.CheckSum;
+                            Currency = oPayment.DocCurrency;
+                            Rate = oPayment.DocRate;
+                        }
+                        else
+                        {
+                            Amount = oPayment.Checks.CheckSum;
+                            Currency = "VES";
+                            Rate = 0;
+                        }
+
+                    }
+                    else if (!String.IsNullOrWhiteSpace(oPayment.CreditCards.CreditAcct))
+                    {
+                        accountCode = oPayment.CreditCards.CreditAcct;
+                        Date = oPayment.DocDate;
+
+                        if (!String.IsNullOrWhiteSpace(oPayment.DocCurrency) && oPayment.DocCurrency != "VES")
+                        {
+                            Amount = oPayment.CreditCards.CreditSum;
+                            Currency = oPayment.DocCurrency;
+                            Rate = oPayment.DocRate;
+                        }
+                        else
+                        {
+                            Amount = oPayment.CreditCards.CreditSum;
+                            Currency = "VES";
+                            Rate = 0;
+                        }
+
+                    }
+                    else
+                    {
+                        accountCode = "";
+                    }
+
+
+
+                    if (!String.IsNullOrWhiteSpace(accountCode))
+                    {
+
+                        var IntercompanyDestiny = IntercompanyList.FirstOrDefault(p => p.AccountCode == accountCode);
+
+                        if (IntercompanyDestiny != null)
+                        {
+
+                            oTargetCompany = new SAPbobsCOM.Company();
+
+                            // Configura los parámetros de conexión
+                            oTargetCompany.Server = "sofcdba01";
+                            oTargetCompany.LicenseServer = "sofcsap01:30000";
+                            oTargetCompany.DbServerType = SAPbobsCOM.BoDataServerTypes.dst_MSSQL2016;
+                            oTargetCompany.CompanyDB = IntercompanyDestiny.Database;
+                            oTargetCompany.UserName = IntercompanyDestiny.UserName;
+                            oTargetCompany.Password = IntercompanyDestiny.Password;
+
+                            // Conectar
+                            int lRetCode = oTargetCompany.Connect();
+                            if (lRetCode != 0)
+                            {
+                                string errMsg;
+                                int errCode;
+                                oTargetCompany.GetLastError(out errCode, out errMsg);
+                                Application.SBO_Application.StatusBar.SetText("Error: " + errCode, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+                                return;
+
+                            }
+                            else
+                            {
+
+                                var IntercompanyOrigin = IntercompanyList.FirstOrDefault(p => p.Database == mySBOCompany.CompanyDB);
+
+                                SAPbobsCOM.JournalEntries oJE = (SAPbobsCOM.JournalEntries)oTargetCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.oJournalEntries);
+
+                                oJE.ReferenceDate = Date;
+                                oJE.DueDate = Date;
+                                oJE.TaxDate = Date;
+                                oJE.Memo = Truncar(oPayment.Remarks, 49);
+
+                                if (Currency == "VES")
+                                {
+                                    oJE.Lines.AccountCode = IntercompanyOrigin.ReceivableAccount; // Cuenta por cobrar intercompany
+                                    oJE.Lines.Debit = Amount;
+                                    oJE.Lines.Add();
+
+                                    oJE.Lines.AccountCode = BankAccount; // Cuenta bancaria intercompany
+                                    oJE.Lines.Credit = Amount;
+                                    oJE.Lines.Add();
+
+                                }
+                                else
+                                {
+                                    oJE.Lines.FCCurrency = Currency;
+                                    oJE.Lines.AccountCode = IntercompanyOrigin.ReceivableAccount; // Cuenta por cobrar intercompany
+                                    oJE.Lines.FCDebit = Math.Round(Convert.ToDouble(Amount / Rate), 2);
+                                    oJE.Lines.Debit = Amount;
+
+                                    oJE.Lines.Add();
+
+                                    oJE.Lines.FCCurrency = Currency;
+                                    oJE.Lines.AccountCode = BankAccount; // Cuenta bancaria intercompany
+                                    oJE.Lines.FCCredit = Math.Round(Convert.ToDouble(Amount / Rate), 2);
+                                    oJE.Lines.Credit = Amount;
+
+                                    oJE.Lines.Add();
+                                }
+
+                                int res = oJE.Add();
+
+                                if (res != 0)
+                                {
+                                    string errMsg;
+                                    int errCode;
+                                    oTargetCompany.GetLastError(out errCode, out errMsg);
+                                    Application.SBO_Application.StatusBar.SetText("Error al crear el asiento: " + errCode + " " + errMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                                    int result = oPayment.Cancel();
+
+                                    if (result != 0)
+                                    {
+                                        errMsg = "";
+                                        mySBOCompany.GetLastError(out result, out errMsg);
+                                        Application.SBO_Application.StatusBar.SetText("Error al cancelar el pago: " + oPayment.DocNum + " " + errCode + " " + errMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                                    }
+                                    else
+                                    {
+                                        Application.SBO_Application.StatusBar.SetText("Pago: " + oPayment.DocNum + " cancelado correctamente", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
+
+                                    }
+
+
+
+                                }
+                                else
+                                {
+                                    Application.SBO_Application.StatusBar.SetText("Asiento de intercompany hacia " + IntercompanyDestiny.Enterprise + " creado exitosamente en base destino.", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+
+                                }
+                            }
+                        }
+
+                        else
+                        {
+                            Application.SBO_Application.StatusBar.SetText("Error: No se encontro datos de intercompañia", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
+
+                            
+                        }
+
+
+                    }
+                    else
+                    {
+                        Application.SBO_Application.StatusBar.SetText("Error: Cuenta de intercompañia no puede estar vacia", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                    }
+
+                }
+            }
+            catch (Exception ex)
+            {
+                string errMsg;
+                int errCode;
+               
+                Application.SBO_Application.StatusBar.SetText("Error al crear el asiento: " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                int result = oPayment.Cancel();
+
+                if (result != 0)
+                {
+                    errMsg = "";
+                    mySBOCompany.GetLastError(out result, out errMsg);
+                    Application.SBO_Application.StatusBar.SetText("Error al cancelar el pago: " + oPayment.DocNum + " " + errMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+
+                }
+                else
+                {
+                    Application.SBO_Application.StatusBar.SetText("Pago: " + oPayment.DocNum + " cancelado correctamente", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
+
+                }
+            }
+
+           
+        }
+
+        public static void SBO_Application_AppEvent(SAPbouiCOM.BoAppEventTypes EventType)
+        {
+            switch (EventType)
+            {
+                case SAPbouiCOM.BoAppEventTypes.aet_ShutDown:
+                    //Exit Add-On
+                    System.Windows.Forms.Application.Exit();
+                    break;
+                case SAPbouiCOM.BoAppEventTypes.aet_CompanyChanged:
+                    break;
+                case SAPbouiCOM.BoAppEventTypes.aet_FontChanged:
+                    break;
+                case SAPbouiCOM.BoAppEventTypes.aet_LanguageChanged:
+                    break;
+                case SAPbouiCOM.BoAppEventTypes.aet_ServerTerminition:
+                    break;
+                default:
+                    break;
+            }
+        }
+
+
+          
+        //private void SetExchangeRate()
+        //{
+        //    if (mySBOCompany.Connect() != 0)
+        //    {
+        //        Application.SBO_Application.StatusBar.SetText("Error de conexion: " + mySBOCompany.GetLastErrorDescription(), SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Error);
+
+        //    }
+        //    else
+        //    {
+        //        double RateUSD=0;
+        //        double RateBCV = 0;
+
+        //        SAPbobsCOM.SBObob mySBObob = null;
+
+        //        mySBObob = (SAPbobsCOM.SBObob)mySBOCompany.GetBusinessObject(BoObjectTypes.BoBridge);
+
+        //        myRecorset = null;
+
+        //        myRecorset = (SAPbobsCOM.Recordset)mySBOCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+        //        try
+        //        {
+        //            RateBCV = GetExchangeRateBCV();
+
+        //            myRecorset = mySBObob.GetCurrencyRate("USD", DateTime.Now);
+
+        //            while (!(myRecorset.EoF))
+        //            {
+
+        //                RateUSD = Convert.ToDouble(myRecorset.Fields.Item("CurrencyRate").Value);
+
+        //                myRecorset.MoveNext();
+
+        //                break;
+        //            }
+
+        //            if (RateUSD != Convert.ToDouble(Math.Round(RateBCV, 2)))//Rate USD in SAP B1 is diferente to the BCV for the specific day
+        //            {
+        //                if (RateBCV == 0)
+        //                {
+
+        //                    Application.SBO_Application.StatusBar.SetText("No se logro establecer conexion con el servidor del BCV", SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Warning);
+        //                }
+        //                else
+        //                {
+        //                    mySBObob.SetCurrencyRate("USD", DateTime.Now, RateBCV, true);
+
+        //                    Application.SBO_Application.StatusBar.SetText("Tipo de Cambio Actualizado Correctamente", SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Success);
+
+        //                }
+        //            }
+        //            else
+        //            {
+
+        //                Application.SBO_Application.StatusBar.SetText("Tipo de cambio ya se encuentra actualizado", SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Warning);
+
+        //            }
+
+
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            if (ex.HResult == -4006)//ExchangeRate not exist for the specific day. Add 
+        //            {
+        //                if (RateBCV == 0)
+        //                {
+
+        //                    Application.SBO_Application.StatusBar.SetText("No se logro establecer conexion con el servidor del BCV", SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Warning);
+        //                }
+        //                else
+        //                {
+
+        //                    mySBObob.SetCurrencyRate("USD", DateTime.Now, RateBCV, false);
+
+        //                    Application.SBO_Application.StatusBar.SetText("Tipo de Cambio Creado Correctamente", SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Success);
+
+        //                }
+
+
+        //            }
+        //            else
+        //            {
+
+        //                Application.SBO_Application.StatusBar.SetText("Error al registrar tipo de cambio", SAPbouiCOM.BoMessageTime.bmt_Medium, SAPbouiCOM.BoStatusBarMessageType.smt_Error);
+
+        //            }
+        //        }
+        //    }
+
+        //}
+
+        //private double GetExchangeRateBCV()
+        //{
+        //    string url = "http://www.bcv.org.ve";
+
+        //    double RateUSD = 0;
+
+        //    string Value = null;
+
+        //    try
+        //    {
+
+        //        var web = new HtmlWeb();
+
+        //        HtmlDocument doc = web.Load(url);
+
+        //        //var datePage = doc.DocumentNode.SelectNodes("//*[@id=\"block-views-612b6aaa739877c430ffe6a2079ce5a8\"]/div/div[2]/div/div[8]/span")[0].InnerText; // obtiene el dia de la pagina del banco central
+
+        //        //DateTime datetimePage = Convert.ToDateTime(datePage); //convierte el valor en campo de tipo fecha
+
+        //        Value = doc.DocumentNode.SelectNodes("//*[@id=\"dolar\"]/div/div/div[2]/strong")[0].InnerText; //obtiene tasa del dia en la pagina
+
+        //        RateUSD = Convert.ToDouble(Value);
+
+        //        return RateUSD;
+
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        return RateUSD;
+        //    }
+
+
+
+
+        //}
+
+    }
+}
