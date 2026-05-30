@@ -1,0 +1,2145 @@
+USE [VISTA]
+GO
+/****** Object:  StoredProcedure [dbo].[spStockInquiryConc]    Script Date: 5/30/2026 12:31:06 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER OFF
+GO
+
+ALTER PROCEDURE [dbo].[spStockInquiryConc] (
+	@Workstation		VARCHAR(10),
+	@UserNo				INTEGER,
+	@FromDate 			DATETIME,	--The date range from which the report should draw data	
+ 	@ToDate				DATETIME,
+	@Location			VARCHAR(4),	--Stock Location	
+	@UseStartTimeOfDay	VARCHAR(1),
+	@CostType			VARCHAR(10) = 'STANDARD',	-- Pass the 
+	@SQLFilter			VARCHAR(5000) = '',
+  @DebugMode CHAR(1) = 'N'
+	)
+AS
+/****************************************************************************************************************/
+/*	spStockInquiryConc VERSION 3.00.03(M) 07/03/2005								*/
+/****************************************************************************************************************/
+-- Prevent any shared locks being created during execution of SP
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+DECLARE @InquiryID		AS INTEGER
+DECLARE	@AppendExisting 	AS CHAR(1)
+DECLARE	@LastTransaction	AS DATETIME 
+DECLARE @SQL			as NVARCHAR(MAX)
+DECLARE @SelectionStart		AS DATETIME
+DECLARE @FromDateTime		AS DATETIME
+DECLARE @ToDateTime		AS DATETIME
+DECLARE @StartTimeOfDay		AS DATETIME
+DECLARE @MinLastStocktakeDate	AS DATETIME
+DECLARE @TotalSales 		AS DECIMAL(28,13)
+DECLARE @HighestStocktakeFrequency AS Integer
+DECLARE @CostTax		AS VARCHAR(20)
+DECLARE @RetailTax	AS VARCHAR(20)
+DECLARE @UseFromDate as CHAR(1)
+DECLARE @UseFromDateAsLastStocktakeDate as CHAR(1)
+DECLARE @PriceBookToUse AS NVARCHAR(510)				
+    
+-- Variables for Debugging
+DECLARE @StartTime as DateTime
+-- Set the Value for Debug Mode 
+SET NOCOUNT ON
+SET @StartTime = dbo.GetLocalDate()
+DECLARE @StocktakeMode		AS VARCHAR(30)
+SELECT @StocktakeMode = Configure_strValue FROM tblConfigure WHERE Configure_strName = 'StocktakeMode'
+DECLARE @CurrencyScale	INTEGER
+SELECT @CurrencyScale = Configure_strValue FROM tblConfigure WHERE Configure_strName = 'CurrencyScale'
+SET @PriceBookToUse = ISNULL( ( SELECT Configure_strValue FROM tblConfigure WHERE Configure_strName = 'PriceBookToUse' ), '' )
+-- MP 2008/06/19
+-- Default this to N, meaning the Last Stocktake Date is the actual Last Stocktake date for each Item
+SET @UseFromDateAsLastStocktakeDate = 'N'
+-- SC: 30 May. Use CurrencyFormat to determine the rounding place for Retail Price
+DECLARE	@strRoundingSalesValue varchar(50)
+DECLARE 	@intRoundingSalesValue int	
+SELECT @strRoundingSalesValue =  Configure_strValue FROM tblConfigure WHERE Configure_strName = 'CurrencyFormat'
+IF CHARINDEX('.', @strRoundingSalesValue)>0 
+SET @intRoundingSalesValue = 
+ LEN(RIGHT(@strRoundingSalesValue,LEN(@strRoundingSalesValue)-CHARINDEX('.', @strRoundingSalesValue)))
+ELSE
+SET  @intRoundingSalesValue = 0 	
+DECLARE @CostCurrencyScale	AS INTEGER
+SET @CostCurrencyScale = 10	--Hardcode the 10 decimal places because we should not actually be doing any rounding on Cost
+-- Retail Prices Include Tax
+SELECT @RetailTax = Configure_strValue FROM tblConfigure WHERE Configure_strName = 'PriceModeConcessions'
+-- Cost Prices Include Tax
+SELECT @CostTax = Configure_strValue FROM tblConfigure WHERE Configure_strName = 'CostModeConcessions'
+-- Validate what information was passed into this SP
+--
+--	B16135 MTS :: Documentation
+--
+--	Why is this segment of code here?
+--		When the Stock Inquiry Conc[essions] SP is executed from "create stock take"
+--		it passes a NULL value as @FromDate, so the first test fails. It also passes
+--		empty string as @Location, so the first test in the ELSE block succeeds and
+--		the variable @UseFromDateAsLastStocktakeDate is set to Y. This variable is
+--		used to overwrite ALL the LastStocktakeDate values immediately before the
+--		end of the SP with the value of @FromDate.
+--
+--		B16135 removes the "at all costs" over-write under instruction from Mark Pattie.
+--		This change may cause future issues because the behaviour has been changed.
+--
+IF IsDate(@FromDate) <> 1 AND NOT ISNULL(@SQLFilter, '') = ''
+BEGIN 
+		SET @SQL = 
+			N'SELECT @LastSTake = MAX(Stock_dtmLastSTake) 
+				FROM (SELECT ss.*, 
+							i.Item_strItemId AS Item_strCode, i.Class_strCode AS Item_strClass, i.StakeGrp_strCode, i.Vendor_strCode, g.StakeGrp_strFrequency AS StocktakeFrequencyCode
+						FROM tblStock_Status ss
+						JOIN tblItem i ON i.Item_strItemId = ss.Item_strItemId
+						LEFT JOIN tblStocktake_Group g ON g.StakeGrp_strCode = i.StakeGrp_strCode) a
+				WHERE 1 = 1 ' + @SQLFilter 
+				
+		EXEC sp_executesql @SQL, 
+	           N'@LastSTake DATETIME output', @LastSTake = @FromDate output;			
+		IF IsDate(@FromDate) = 1
+		BEGIN
+			SET @UseFromDate = 'Y'
+			
+			-- MP 2008/06/19
+			-- Change to Y, meaning the Last Stocktake Date now becomes the From Date - DONE at the end of this SP
+			SET @UseFromDateAsLastStocktakeDate = 'Y'
+		END
+END
+IF IsDate(@FromDate) = 1
+	SET @UseFromDate = 'Y'
+ELSE
+BEGIN
+	-- MP 2008/06/19
+	-- If no From Date is used, then this must be a Stocktake Creation or Refresh. We will assign a date which is the Max Date of the last stocktake.
+	-- If no Date Exists, then the @UseFromDate field will remain set to N
+	-- Doing this because it is faster to provide a From Date and a To Date, rather than just a from Date
+	-- Also need to manipulate the Last Stocktake Date field at the end of this SP to be the From Date Passed in, as the Opening Balance we calculate will be for the From Date and not the Actual Last Stocktake Date.
+	IF ISNULL(@Location, '') = '' 
+	BEGIN
+		IF  (SELECT MAX(STake_dtmDateTime) FROM tblStockTakeDates) IS NOT NULL 
+		BEGIN
+			SET @FromDate = (SELECT MAX(STake_dtmDateTime) FROM tblStockTakeDates)
+			SET @UseFromDate = 'Y'
+			
+			-- MP 2008/06/19
+			-- Change to Y, meaning the Last Stocktake Date now becomes the From Date - DONE at the end of this SP
+			SET @UseFromDateAsLastStocktakeDate = 'Y'
+		END
+		ELSE
+		BEGIN
+			SET @UseFromDate = 'N'
+		END
+	END
+	ELSE
+	BEGIN	
+		IF  (SELECT MAX(STake_dtmDateTime) FROM tblStockTakeDates WHERE Location_strCode = @Location) IS NOT NULL 
+		BEGIN
+			SET @FromDate = (SELECT MAX(STake_dtmDateTime) FROM tblStockTakeDates WHERE Location_strCode = @Location)
+			SET @UseFromDate = 'Y'
+			-- Change to Y, meaning the Last Stocktake Date now becomes the From Date - DONE at the end of this SP
+			SET @UseFromDateAsLastStocktakeDate = 'Y'
+		END
+		ELSE
+		BEGIN
+			SET @UseFromDate = 'N'
+		END
+	END			 
+END
+IF @UseStartTimeOfDay = 'Y'
+	BEGIN
+		SELECT @StartTimeOfDay = Configure_strValue From tblConfigure 
+		Where Configure_strName = 'StartTimeOfDay'
+		SELECT @FromDateTime = DATEADD(hh, datepart(hh,@StartTimeOfDay), @FromDate)
+		SELECT @FromDateTime = DATEADD(mi, datepart(mi,@StartTimeOfDay), @FromDateTime)
+		SELECT @ToDateTime = DATEADD(hh, datepart(hh,@StartTimeOfDay), @ToDate)
+		SELECT @ToDateTime = DATEADD(mi, datepart(mi,@StartTimeOfDay), @ToDateTime)
+	END
+ELSE
+	BEGIN
+		SET @FromDateTime = @FromDate
+		SET @ToDateTime = @ToDate
+	END
+	SELECT @InquiryID = Inquiry_intID FROM tblStockInquiryConcHeader
+	WHERE WorkStation_strCode = @Workstation
+	AND User_intUserNo = @UserNo
+--------------------------------------------------------------------------------------------------------------
+-- If the Opening Date passed in is Null, then set the From Date to be the Closing Date
+-- The reason is because the FromDateTime is used to find the stocktake prior to this date.
+-- If it is null, then the SP wont find a previous stocktake.  So set it to the closing date, because
+-- in this case, we want to find the stocktake that occured prior to the closing date
+If @UseFromDate = 'N' 
+	SET @FromDateTime = @ToDateTime
+--------------------------------------------------------------------------------------------------------------
+IF @DebugMode = 'Y'
+BEGIN
+	PRINT @StartTime
+END
+DECLARE @CurrentDate DateTime
+SET @CurrentDate = dbo.GetLocalDate()
+--	B16135 MTS : @InquiryID is ALWAYS NULL at this point, so why is there
+--				 an IF...ELSE construct?
+IF @InquiryID IS NULL 
+BEGIN
+	-- Delete data in these tables more than 2 hours old. (MP 23/6/08)
+	DELETE FROM tblStockInquiryConcHeader WHERE RunDateTime < DATEADD(hh, -2, @CurrentDate)
+	DELETE FROM tblStockInquiryConc WHERE Inquiry_intID NOT IN (SELECT DISTINCT Inquiry_intID FROM tblStockInquiryConcHeader)
+	SET @AppendExisting = 'N'
+END
+ELSE
+BEGIN
+	IF (SELECT DateFrom FROM tblStockInquiryConcHeader WHERE Inquiry_intID = @InquiryID) = @FromDate
+	AND (SELECT DateTo FROM tblStockInquiryConcHeader WHERE Inquiry_intID = @InquiryID) = @ToDate
+	AND (SELECT Location_strCode FROM tblStockInquiryConcHeader WHERE Inquiry_intID = @InquiryID) = @Location
+	BEGIN
+		SET @AppendExisting = 'Y'		
+		SELECT @LastTransaction = LastTransDateTime FROM tblStockInquiryConcHeader
+		WHERE Inquiry_intID = @InquiryID
+	END
+	ELSE
+	BEGIN
+		DELETE FROM tblStockInquiryConc WHERE Inquiry_intID = @InquiryID
+		DELETE FROM tblStockInquiryConcHeader WHERE Inquiry_intID = @InquiryID
+		SET @AppendExisting = 'N'
+		-- Delete data in these tables more than 2 hours old. (MP 23/6/08)
+		DELETE FROM tblStockInquiryConcHeader WHERE RunDateTime < DATEADD(hh, -2, @CurrentDate)
+		DELETE FROM tblStockInquiryConc WHERE Inquiry_intID NOT IN (SELECT DISTINCT Inquiry_intID FROM tblStockInquiryConcHeader)
+		
+	END
+END
+IF @AppendExisting = 'N'
+BEGIN
+	INSERT INTO tblStockInquiryConcHeader 
+	(User_intUserNo,WorkStation_strCode,DateFrom,DateTo,Location_strCode,RunDateTime,AppendExisting, CostType)
+	VALUES	
+	(@UserNo,@Workstation,@FromDate,@ToDate,@Location,dbo.GetLocalDate(),'N', @CostType)
+	SELECT @InquiryID = Inquiry_intID FROM tblStockInquiryConcHeader
+	WHERE WorkStation_strCode = @Workstation
+	AND User_intUserNo = @UserNo
+	DECLARE @ActualDate datetime = ISNULL(@ToDate, dbo.GetLocalDate());
+	WITH ItemPriceListCTE AS
+	(
+		--Replace it if there is a valid price in the price book.
+		SELECT
+			D.PriceD_curPrice, 
+			D.Item_strItemId,
+			ROW_NUMBER() OVER 
+			(
+				PARTITION BY
+					PL.CinOperator_strCode,
+					D.Item_strItemId
+				ORDER BY 
+					CASE WHEN @PriceBookToUse = 'Most Recent Start Date' THEN CAST(H.PriceH_dtmEffectiveFrom AS date) ELSE NULL END DESC,
+					CASE WHEN @PriceBookToUse = 'Most Recent Start Date' THEN H.PriceH_intStartTime ELSE NULL END DESC,
+					D.PriceD_curPrice ASC
+			) AS [Rank]
+		FROM 
+			tblPriceListHeader H
+		INNER JOIN 
+			tblPriceListDetails D
+		ON
+			D.PriceH_strCode = H.PriceH_strCode
+		AND
+			D.PriceD_strStatus = 'A'
+		INNER JOIN
+			tblStock_Status SS 
+		ON
+			SS.Item_strItemId = D.Item_strItemId
+		INNER JOIN 
+			tblStock_Location SL
+		ON
+			SL.Location_strCode = SS.Location_strCode
+		AND
+			SL.Location_strDefault = 'Y'
+		INNER JOIN 
+			tblPriceListLink PL
+		ON 
+			PL.PriceH_strCode = H.PriceH_strCode
+		AND 
+			PL.CinOperator_strCode = SL.CinOperator_strCode
+		WHERE
+			H.PriceH_strStatus = 'A'
+		AND 
+			H.PriceH_dtmEffectiveFrom <= @ActualDate
+		AND 
+			H.PriceH_dtmEffectiveTo >= @ActualDate
+		AND 
+			CASE DATEPART(dw, @ActualDate)
+				WHEN 1 THEN H.PriceH_strSunday
+				WHEN 2 THEN H.PriceH_strMonday
+				WHEN 3 THEN H.PriceH_strTuesday
+				WHEN 4 THEN H.PriceH_strWednesday
+				WHEN 5 THEN H.PriceH_strThursday
+				WHEN 6 THEN H.PriceH_strFriday
+				WHEN 7 THEN H.PriceH_strSaturday 
+			END = 'Y'
+		-- MVW 22 Jul 2015  Default to Price Book with Latest Effective From Date
+	)
+	-- MP 2007/11/15 V3R3 Change to only include Item/Location Combinations that are in Stock Status.
+	INSERT INTO tblStockInquiryConc
+	(	Inquiry_intID,Item_strCode,Item_strClass,Location_strCode,Location_strDescription,Class_strDescription,
+		Item_strItemType,Item_strReport,Item_strDescription, BaseUOMCode,StockUOMCode,StockUOMConv, SaleUOMConv,
+		Item_strStocktakeable, StakeGrp_strCode, Item_strBoxOfficeSundry, Item_strHOCode, Item_strStatus, Vendor_strCode,
+		Item_curRetailPrice, BusinessDate, Item_decCostPrice
+	
+	)
+	
+	--MNS 22 June 2012 T20510: Use fnGetStockRetailPrice to find the items retail price, instead of just selecting it from tblItem.
+  --WW 14 May 2018: move logic in fnGetStockRetailPrice as a SQL JOIN, because it was slowing down the stored procedure by 10+ seconds one some databases.
+	SELECT @InquiryID, i.Item_strItemId,i.Class_strCode,sl.Location_strCode, sl.Location_strDescription, 
+		c.Class_strDescription, i.Item_strItemType,'N', i.Item_strItemDescription, i.Item_strBaseUOMCode, 
+		i.Item_strStockUOMCode, i.Item_curStockUOMConv, i.Item_curSaleUOMConv,
+		i.Item_strStocktakeable, i.StakeGrp_strCode, i.Item_strReport, i.Item_strMasterItemCode, i.Item_strStatus, i.Vendor_strCode,
+		COALESCE(BestPrice.PriceD_curPrice,i.Item_curRetailPrice, 0), @ToDate, i.Item_decCostPrice
+	FROM tblItem i
+  INNER JOIN tblItem_Class c ON i.Class_strCode = c.Class_strCode
+  INNER JOIN tblStock_Status status ON i.Item_strItemId = status.Item_strItemId
+  INNER JOIN tblStock_Location sl ON sl.Location_strCode = status.Location_strCode
+  LEFT JOIN ItemPriceListCTE As BestPrice ON BestPrice.Item_strItemId = i.Item_strItemId AND BestPrice.Rank = 1
+	ORDER BY i.Item_strItemId, sl.Location_strCode
+  OPTION(RECOMPILE)
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Get all Items took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+	IF @Location <> ''
+		DELETE FROM tblStockInquiryConc WHERE Location_strCode <> @Location
+		AND Inquiry_intID = @InquiryID
+	UPDATE tblStockInquiryConc
+	SET Vendor_strDescription = v.Vendor_strName
+	FROM tblVendor v, tblStockInquiryConc sc
+	WHERE sc.Vendor_strCode = v.Vendor_strCode
+	AND sc.Inquiry_intID = @InquiryID
+	-- Set the Retail Price to be what ever the system setting is. If TaxINCLUSIVE, then nothing gets changed,
+	-- If tax exclusive, we need to take the tax off.
+	
+	
+If @RetailTax = 'TaxINCLUSIVE'	-- If Prices include tax, then for Net we take it off
+	BEGIN
+		UPDATE tblStockInquiryConc
+		SET Item_curNetRetailPrice = sc.Item_curRetailPrice - Round(CASE WHEN sc.Item_curRetailPrice < (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+										CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+										CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+										CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END) THEN Round(sc.Item_curRetailPrice, @intRoundingSalesValue)
+	
+									ELSE	(CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate,@intRoundingSalesValue) ELSE 0 END + 
+									CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+									CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+									CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END) +
+	 								
+									CASE WHEN tax.STax_strRateType = 'P' Then Round(sc.Item_curRetailPrice - Round((CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END), @intRoundingSalesValue) - (sc.Item_curRetailPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END)) / ((tax.STax_curRate/100) + 1), @intRoundingSalesValue) Else 0 END + 
+	
+		 							CASE WHEN tax.STax_strRateType2 = 'P' Then Round(sc.Item_curRetailPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END), @intRoundingSalesValue) - Round((sc.Item_curRetailPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END)) / ((tax.STax_curRate2/100) + 1), @intRoundingSalesValue) Else 0 END + 
+	
+		 							CASE WHEN tax.STax_strRateType3 = 'P' Then Round(sc.Item_curRetailPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END), @intRoundingSalesValue) - Round((sc.Item_curRetailPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END)) / ((tax.STax_curRate3/100) + 1), @intRoundingSalesValue) Else 0 END + 
+	
+								 	CASE WHEN tax.STax_strRateType4 = 'P' Then Round(sc.Item_curRetailPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END), @intRoundingSalesValue) - Round((sc.Item_curRetailPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END)) / ((tax.STax_curRate4/100) + 1), @intRoundingSalesValue) Else 0 END  
+	
+									END, @intRoundingSalesValue)
+		FROM tblStockInquiryConc sc, tblItem item, tblSalesTax tax
+		WHERE sc.Item_strCode = item.Item_strItemId
+		AND item.STax_strCode = tax.STax_strCode
+		AND sc.Inquiry_intID = @InquiryID
+	END
+	ELSE	-- If Prices Exclude Tax, then Retail Price becomes Net Price, and then add tax to retail figure
+	BEGIN
+		
+		UPDATE tblStockInquiryConc
+		SET Item_curNetRetailPrice = sc.Item_curRetailPrice,
+		    Item_curRetailPrice = Round(sc.Item_curRetailPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+									CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+									CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+									CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END) +
+	 								Round(CASE WHEN tax.STax_strRateType = 'P' Then (tax.STax_curRate/100) * (sc.Item_curRetailPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END))Else 0 END, @intRoundingSalesValue) + 
+	
+		 							Round(CASE WHEN tax.STax_strRateType2 = 'P' Then (tax.STax_curRate2/100) * (sc.Item_curRetailPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END))Else 0 END, @intRoundingSalesValue) + 
+	
+		 							Round(CASE WHEN tax.STax_strRateType3 = 'P' Then (tax.STax_curRate3/100) * (sc.Item_curRetailPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END))Else 0 END, @intRoundingSalesValue) + 
+	
+								 	Round(CASE WHEN tax.STax_strRateType4 = 'P' Then (tax.STax_curRate4/100) * (sc.Item_curRetailPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @intRoundingSalesValue) ELSE 0 END + 
+																					CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @intRoundingSalesValue) ELSE 0 END +
+																					CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @intRoundingSalesValue) ELSE 0 END))Else 0 END, @intRoundingSalesValue), @intRoundingSalesValue)
+		FROM tblStockInquiryConc sc, tblItem item, tblSalesTax tax
+		WHERE sc.Item_strCode = item.Item_strItemId
+		AND item.STax_strCode = tax.STax_strCode
+		AND sc.Inquiry_intID = @InquiryID
+		
+	END
+	IF @CostTax = 'TaxINCLUSIVE' -- If Cost Prices include tax, then for Net we take it off
+	BEGIN
+		UPDATE tblStockInquiryConc
+		SET Item_decNetCostPrice = ROUND(sc.Item_decCostPrice - (CASE WHEN sc.Item_decCostPrice < (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																									CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																									CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																									CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END)
+																		THEN Round(sc.Item_decCostPrice, @CostCurrencyScale)
+																		ELSE	(CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END) +
+ 								CASE WHEN tax.STax_strRateType = 'P' Then Round(sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END), @CostCurrencyScale) - Round((sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END))/ ((tax.STax_curRate/100) + 1), @CostCurrencyScale) Else 0 END + 
+	 							CASE WHEN tax.STax_strRateType2 = 'P' Then Round(sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END), @CostCurrencyScale) - Round((sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END))/ ((tax.STax_curRate2/100) + 1), @CostCurrencyScale) Else 0 END + 
+	 							CASE WHEN tax.STax_strRateType3 = 'P' Then Round(sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END), @CostCurrencyScale) - Round((sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END))/ ((tax.STax_curRate3/100) + 1), @CostCurrencyScale) Else 0 END + 
+							 	CASE WHEN tax.STax_strRateType4 = 'P' Then Round(sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END), @CostCurrencyScale) - Round((sc.Item_decCostPrice - (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END))/ ((tax.STax_curRate4/100) + 1), @CostCurrencyScale) Else 0 END 
+								END),@CostCurrencyScale)
+		FROM tblStockInquiryConc sc, tblItem item, tblSalesTax tax
+		WHERE sc.Item_strCode = item.Item_strItemId
+		AND item.STax_strCode = tax.STax_strCode
+		AND sc.Inquiry_intID = @InquiryID
+	END
+	ELSE	-- If Cost Prices Exclude tax, the Cost Price Becomes Net Price, and Add tax the Cost Price
+	BEGIN
+		UPDATE tblStockInquiryConc
+		SET Item_decNetCostPrice = sc.Item_decCostPrice,
+		    Item_decCostPrice = ROUND(sc.Item_decCostPrice + (CASE WHEN tax.STax_strRateType = 'F' Then ROUND(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																CASE WHEN tax.STax_strRateType2 = 'F' Then ROUND(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																CASE WHEN tax.STax_strRateType3 = 'F' Then ROUND(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																CASE WHEN tax.STax_strRateType4 = 'F' Then ROUND(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END) +
+ 								CASE WHEN tax.STax_strRateType = 'P' Then Round((tax.STax_curRate/100) * (sc.Item_decCostPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END)), @CostCurrencyScale) Else 0 END + 
+	 							CASE WHEN tax.STax_strRateType2 = 'P' Then Round((tax.STax_curRate2/100) * (sc.Item_decCostPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END)), @CostCurrencyScale) Else 0 END + 
+	 							CASE WHEN tax.STax_strRateType3 = 'P' Then Round((tax.STax_curRate3/100) * (sc.Item_decCostPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END)), @CostCurrencyScale) Else 0 END + 
+							 	CASE WHEN tax.STax_strRateType4 = 'P' Then Round((tax.STax_curRate4/100) * (sc.Item_decCostPrice + (CASE WHEN tax.STax_strRateType = 'F' Then Round(tax.STax_curRate, @CostCurrencyScale) ELSE 0 END + 
+																				CASE WHEN tax.STax_strRateType2 = 'F' Then Round(tax.STax_curRate2, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType3 = 'F' Then Round(tax.STax_curRate3, @CostCurrencyScale) ELSE 0 END +
+																				CASE WHEN tax.STax_strRateType4 = 'F' Then Round(tax.STax_curRate4, @CostCurrencyScale) ELSE 0 END)), @CostCurrencyScale) Else 0 END, @CostCurrencyScale)
+								
+		FROM tblStockInquiryConc sc, tblItem item, tblSalesTax tax
+		WHERE sc.Item_strCode = item.Item_strItemId
+		AND item.STax_strCode = tax.STax_strCode
+		AND sc.Inquiry_intID = @InquiryID
+	END
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Working out Tax took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+	-- Storing the OverCounter Cost and Retail Prices For Lowes
+	
+	UPDATE tblStockInquiryConc
+	SET Item_decCostPriceOverCounter = Item_decCostPrice,
+	Item_curRetailPriceOverCounter =  Item_curRetailPrice,
+	Item_decNetCostPriceOverCounter = Item_decNetCostPrice,
+	Item_curNetRetailPriceOverCounter =  Item_curNetRetailPrice
+	WHERE Inquiry_intID = @InquiryID
+	UPDATE tblStockInquiryConc 
+	SET Item_strItemTypeDesc = l.vcValue
+	FROM tblStockInquiryConc s, tblLookup l  
+	WHERE l.vcName = s.Item_strItemType
+	AND l.vcIdentifier = 'ITEMTYPE'
+	AND Inquiry_intID = @InquiryID
+	UPDATE tblStockInquiryConc
+	SET StakeGrp_strName = sg.StakeGrp_strName,
+	    StocktakeFrequencyCode = sg.StakeGrp_strFrequency
+	FROM tblStockInquiryConc s, tblStocktake_Group sg
+	WHERE s.StakeGrp_strCode = sg.StakeGrp_strCode
+	AND   Inquiry_intID = @InquiryID
+	UPDATE tblStockInquiryConc
+	SET StocktakeFrequency = lu.vcValue
+	FROM tblStockInquiryConc s, tblLookup lu 
+	WHERE s.StocktakeFrequencyCode = lu.vcName
+	AND   Inquiry_intID = @InquiryID
+	AND   lu.vcIdentifier = 'STOCKFREQ'
+	
+	SET @HighestStocktakeFrequency = (SELECT 3 * MAX(nSequence) FROM tblLookup lu
+					INNER JOIN tblStockInquiryConc s ON s.StocktakeFrequencyCode = lu.vcName
+					WHERE StocktakeFrequency = lu.vcValue AND s.Inquiry_intID = @InquiryID)
+	
+	-- Maximum look back time is one year
+	IF @HighestStocktakeFrequency < 365
+		Set @HighestStocktakeFrequency = 365
+	
+	-- For all Type 'S' Items, Set there Stocktakeable Flag to be 'N'
+	UPDATE tblStockInquiryConc
+	SET Item_strStocktakeable = 'N'
+	WHERE Item_strItemType IN ('S', 'P')	--For Made at Sale Time Items (These are not Stocktaked)
+	AND Inquiry_intID = @InquiryID
+	
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Updating StockInquiryConc Items prior to finding last Stocktake Date took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	
+		/************************************************************************************************************************/
+		/*															*/
+		/*	LOGIC TO CALCULATE LAST 'Z' TRANSACTION DATE									*/
+		/*	============================================									*/
+		/*	1. Look in tblStock_Status to get last Stocktake date where the last stocktake date is less than or equal to	*/
+		/*	   the requested opening balance date										*/
+		/*	2. Now use the Stocktake Dates table. Look in trans_inventory on each stocktake date in reverse order to find	*/
+		/*	   possible opening balance transactions for items where the last 'Z' transaction is not known. Go back a max	*/
+		/*	   of twice the largest Frequency is the Stocktake_Group table							*/
+		/*	3. If still nothing found, then this is considered a new item since the last stocktake on the requested date	*/
+		/*															*/
+		/*															*/
+		/************************************************************************************************************************/
+	IF @DebugMode = 'Y'
+		PRINT 'ZTRANSACTIONDATE: Last ::= Stock_dtmLastSTake'
+		-- Insert a record for each date that says when to get the last Z transaction for each item, prior or equal to the startdate
+		-- 1. Look into tblStock_Status first
+		UPDATE tblStockInquiryConc
+		SET LastStocktakeDate = ss.Stock_dtmLastSTake
+		FROM tblStockInquiryConc as si,
+			tblStock_Status ss
+		WHERE	ss.Item_strItemId = si.Item_strCode
+		AND	ss.Location_strCode = si.Location_strCode
+		AND 	si.Inquiry_intID = @InquiryID
+		AND 	ss.Stock_dtmLastSTake <= @FromDateTime
+	
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Updating last Stocktake Date from tblStock_Status took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+		
+	/*
+		-- For all items that have not been stocktaked for 3 Months, and have a balance of zero, set their last stocktake date to be the from date.
+		UPDATE tblStockInquiryConc
+		SET LastStocktakeDate = @FromDateTime
+		FROM tblStockInquiryConc as si,
+			tblStock_Status ss
+		WHERE   ss.Item_strItemId = si.Item_strCode
+		AND	ss.Location_strCode = si.Location_strCode
+		AND 	si.Inquiry_intID = @InquiryID
+		AND	ss.Stock_dtmLastSTake < DATEADD(m, -3, dbo.GetLocalDate())
+		AND 	ss.Stock_curAvailable = 0
+	*/
+	
+	
+	
+		-- For all items that have not been stocktaked for at least 3 Months prior to the From Date, and have a balance of zero, set their last stocktake date to be the from date.
+		/*
+		MP 2007/11/19 - Removed this logic as we now Stocktake Anything that is in tblStock_Status
+	
+		UPDATE tblStockInquiryConc
+		SET LastStocktakeDate = @FromDateTime
+		FROM tblStockInquiryConc as si,
+			tblStock_Status ss,
+			tblLookup lu
+		WHERE   ss.Item_strItemId = si.Item_strCode
+		AND	ss.Location_strCode = si.Location_strCode
+		AND 	si.Inquiry_intID = @InquiryID
+		AND 	si.StocktakeFrequencyCode = lu.vcName
+		AND 	lu.vcIdentifier = 'STOCKFREQ'
+		AND	ss.Stock_dtmLastSTake < DATEADD(d, (CASE WHEN (3 * lu.nSequence) < 93 THEN -93 ELSE (-3 * lu.nSequence) END), @FromDateTime)
+		AND 	ss.Stock_curAvailable = 0
+	*/
+	
+	
+		-- For all items that have never been stocktaked and have a current balance of zero, set their last stocktake date to the from date
+		
+	/*	MP 2007/11/19 - Removed this as we now Stocktake Anything in tblStock_Status. So we should look back up to 1 year to find transactions for that Item.
+		UPDATE tblStockInquiryConc
+		SET    LastStocktakeDate = (SELECT ISNULL(MAX(STake_dtmDateTime), @FromDateTime) FROM tblStockTakeDates sd WHERE STake_dtmDateTime < @FromDateTime AND sd.Location_strCode = si.Location_strCode)
+		FROM 	tblStockInquiryConc as si,
+			tblStock_Status ss
+		WHERE	ss.Item_strItemId = si.Item_strCode
+		AND	ss.Location_strCode = si.Location_strCode
+		AND 	si.Inquiry_intID = @InquiryID
+		AND 	ss.Stock_dtmLastSTake IS NULL
+		AND 	ss.Stock_curAvailable = 0	-- Only if Current Balance is Zero
+	*/
+	
+	IF @DebugMode = 'Y'
+		PRINT 'ZTRANSACTIONDATE: Last ::= @FromDateTime-365days where never counted'
+		-- For any Items that havent been stocktaked, and there Current Balance is none zero, set there stocktake date to exactly one year ago.
+		-- This should cover all new items, that havent been stocktaked yet
+		UPDATE tblStockInquiryConc
+		SET    LastStocktakeDate =DATEADD(dd, -365, @FromDateTime)
+		FROM 	tblStockInquiryConc as si,
+			tblStock_Status ss
+		WHERE	ss.Item_strItemId = si.Item_strCode
+		AND	ss.Location_strCode = si.Location_strCode
+		AND 	si.Inquiry_intID = @InquiryID
+		AND 	ss.Stock_dtmLastSTake IS NULL
+		-- MP 2007/11/19 - Include any balance amounts now - including zero.
+		--AND 	ss.Stock_curAvailable <> 0	-- Only if Current Balance is Not Zero
+	
+	IF @DebugMode = 'Y'
+		PRINT 'ZTRANSACTIONDATE: Last ::= @FromDateTime where not counted'
+		-- For any Items that are not Stocktaked. Set there last Stocktake Date to be the From Date, so we don't calculate movements
+		UPDATE tblStockInquiryConc
+		SET LastStocktakeDate = @FromDateTime
+		WHERE Item_strStocktakeable = 'N'
+		AND Inquiry_intID = @InquiryID
+		-- If in Debug Mode, then Print out Debugging info
+		IF @DebugMode = 'Y'
+		BEGIN
+			PRINT 'Updating last Stocktake Date for not/never counted took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+			SET @StartTime = dbo.GetLocalDate()
+		END
+	
+			
+		-- 2. For the items where they do not have last Z transaction date, look through the transaction dates table in reverse order
+		--    and see if the item appears in one of those transactions
+		--    Only go back 1 year.
+		-- Only keep working this out if there are still unknown z transaction dates
+		IF (SELECT COUNT(*) FROM tblStockInquiryConc WHERE LastStocktakeDate IS NULL AND Item_strStocktakeable = 'Y' AND Inquiry_intID = @InquiryID) > 0 
+		BEGIN
+			IF @DebugMode = 'Y'
+				PRINT 'ZTRANSACTIONDATE: while cursor'
+			DECLARE @ZTransactionDate as Datetime 
+			DECLARE ZTransaction CURSOR 
+			FORWARD_ONLY
+			READ_ONLY
+			FOR SELECT DISTINCT STake_dtmDateTime  FROM tblStockTakeDates WHERE STake_dtmDateTime >= DATEADD(dd, -1 * @HighestStocktakeFrequency, @FromDateTime) AND STake_dtmDateTime <= @FromDateTime ORDER BY STake_dtmDateTime DESC
+			
+			OPEN ZTransaction
+		
+			FETCH NEXT From ZTransaction INTO @ZTransactionDate
+			--	This construct is invalid because FETCH NEXT will yield a -2 if the
+			--	next row is "no longer valid" (i.e. has been deleted between open and now)
+			WHILE @@FETCH_STATUS = 0
+			BEGIN	
+				-- Only keep working this out if there are still unknown z transaction dates
+				--
+				--	It will be much more efficient to move this (IF COUNT(*)...) to be a condition of
+				--	the WHILE loop using EXISTS() because COUNT(*) requires the query traverse the
+				--	data rows where EXISTS will use only indices if this is possible.
+				--
+				--	AND, better still, it gets rid of the lousy GOTO construct...
+				IF (SELECT COUNT(*) FROM tblStockInquiryConc WHERE LastStocktakeDate IS NULL AND Item_strStocktakeable = 'Y' AND Inquiry_intID = @InquiryID) > 0 
+				BEGIN
+	
+					UPDATE tblStockInquiryConc
+					SET LastStocktakeDate = inv.TransI_dtmDateTime
+					FROM tblTrans_Inventory inv, tblStockInquiryConc si
+					WHERE inv.TransI_dtmDateTime = @ZTransactionDate
+					AND	si.LastStocktakeDate IS NULL
+					AND	si.Item_strCode = inv.Item_strItemId
+					AND	si.Location_strCode = inv.Location_strCode
+					AND 	si.Inquiry_intID = @InquiryID
+					AND	si.Item_strStocktakeable = 'Y'
+		   			AND 	inv.TransI_strType = 'Z'
+					
+		
+					
+				END	
+				ELSE
+				BEGIN
+					--	EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEK!!!!!!!!!!!!!!!!!!!!!!
+					--	Rule 1: never use GOTO
+					--	Rule 2: refer rule 1.
+					GOTO ENDCURSOR
+				END 
+				FETCH NEXT From ZTransaction INTO @ZTransactionDate
+			END
+		ENDCURSOR:
+			CLOSE ZTransaction
+			DEALLOCATE ZTransaction
+			-- If in Debug Mode, then Print out Debugging info
+			IF @DebugMode = 'Y'
+			BEGIN
+				PRINT 'Cursor to work out Last Stocktake/Transaction Date took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+				SET @StartTime = dbo.GetLocalDate()
+			END
+		END
+		IF @DebugMode = 'Y'
+			PRINT 'Set last stocktake date back @HighestStocktakeFrequency when NULL'
+		-- If for any items at a location the Last Stocktake Date is still not known, then set it to one year ago.
+		--	This UPDATE statement actually MOVES the date back a year from @FromDateTime
+		UPDATE tblStockInquiryConc
+		SET    LastStocktakeDate = DATEADD(dd, -1 * @HighestStocktakeFrequency, @FromDateTime)
+		WHERE  LastStocktakeDate IS NULL
+		AND    Inquiry_intID = @InquiryID
+		IF @DebugMode = 'Y'
+			PRINT 'QueryStartDate ::= LastStocktakeDate'
+		UPDATE tblStockInquiryConc
+		SET QueryStartDate = LastStocktakeDate
+		WHERE 	Inquiry_intID = @InquiryID
+	
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Working out Last Stocktake/Transaction Date Took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	
+	-- Insert a record into the main table that shows the Balance of the Item at the last Transaction or Stocktake
+	UPDATE tblStockInquiryConc
+	SET 	OpeningQty = t.TransI_curAvailable,
+		OpeningCost = ISNULL(t.TransI_curAvailable * ISNULL(t.TransI_decCostEachNett, (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0))),0)/*/ si.StockUOMConv*/,
+		OpeningQtyStockUOM1 = TransI_curAvailable / si.StockUOMConv,
+		OpeningAverageNettCost = ISNULL(t.TransI_curAvailable * ISNULL(t.TransI_decAvgCostEachNett, (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0))),0)/*/ si.StockUOMConv*/,
+		OpeningLastNettCost = ISNULL(t.TransI_curAvailable * ISNULL(t.TransI_decLastCostEachNett, (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0))),0)/*/ si.StockUOMConv*/,
+		-- MP 2008/05/09 Added Last Cost prior to Report Period. This is used if the Date Range for the report, does not contain a tranaction for an item, so we can use the last cost and average cost prior to the period
+		Item_decNetLastCostPreReportPeriod =  ISNULL(t.TransI_decLastCostEachNett, (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0))),
+		Item_decNetAverageCostPreReportPeriod = ISNULL(t.TransI_decAvgCostEachNett, (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	FROM tblStockInquiryConc si,
+		tblTrans_Inventory t
+	WHERE si.Inquiry_intID = @InquiryID
+	AND  t.Item_strItemId = si.Item_strCode
+	AND t.TransI_dtmDateTime = si.QueryStartDate
+	AND t.Location_strCode = si.Location_strCode
+	
+	
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Inserting the balance at the Last Known Stocktake took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+	-- For any Records that did not get an Opening balance because they have had not transactions, set their Balance to 0
+	UPDATE tblStockInquiryConc
+	SET 	OpeningQty = 0,
+		OpeningCost = 0,
+		OpeningQtyStockUOM1 = 0,
+		OpeningAverageNettCost = 0,
+		OpeningLastNettCost = 0
+	WHERE OpeningQty IS NULL
+	AND QueryStartDate = @FromDateTime
+	AND Inquiry_intID = @InquiryID
+	-- MP 2008/05/12
+	-- Work out the earliest Last Stocktake Date, and use this in the Queries below
+	SET @MinLastStocktakeDate = (SELECT MIN(LastStocktakeDate) FROM tblStockInquiryConc WHERE Inquiry_intID = @InquiryID)
+	
+	-- If we are using a date range, then we need to find out the Opening Balance at the FromDateTime
+	 If @UseFromDate = 'Y' 
+	     -- Figure out Quantity, Value, Cost of the Transactions between LastStockTakeDate and FromDate of the report if required
+	BEGIN
+	    	/*SELECT 	t.Item_strItemId,
+	    		t.Location_strCode,
+	    		SUM((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END)) Quantity,
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * t.TransI_curValueEach / i.Item_curSaleUOMConv,@intRoundingSalesValue),0)) Value, 
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * t.TransI_decCostEach / i.Item_curStockUOMConv,@CostCurrencyScale),0)) Cost,  
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/ i.Item_curStockUOMConv,@CostCurrencyScale),0)) NetCost,
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * (t.TransI_curValueEach - ISNULL(TransI_curSTaxEach,0) 
+	    			- ISNULL(TransI_curSTaxEach2,0)- ISNULL(TransI_curSTaxEach3,0)  - ISNULL(TransI_curSTaxEach4,0)  )
+	    			/ i.Item_curSaleUOMConv,@CurrencyScale),0))  Net,
+			--MP 2007/11/19 Added Nett Average Cost and Nett Last Cost
+			SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decAvgCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/ i.Item_curStockUOMConv,@CostCurrencyScale),0)) NetAverageCost,
+			SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decLastCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/ i.Item_curStockUOMConv,@CostCurrencyScale),0)) NetLastCost
+	    	INTO #tmpOpeningCalc
+	    	FROM tblTrans_Inventory t
+	    	INNER JOIN tblItem i ON t.Item_strItemId = i.Item_strItemId
+	    	INNER JOIN tblStockInquiryConc si ON t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode
+	    	WHERE TransI_dtmDateTime > si.LastStocktakeDate
+	    	AND TransI_dtmDateTime <= @FromDateTime
+	    	AND (TransI_dtmDateCollected IS NULL OR (TransI_dtmDateCollected > si.LastStocktakeDate AND TransI_dtmDateCollected < @FromDateTime))
+	    	AND t.TransI_strType <> 'Z'
+		AND si.Item_strStocktakeable = 'Y'	-- Only need to work out an opening balance for Stocktakeable Items. Non Stocktakeable Items have there Last Stocktake Date set to the From date for this Query
+	    	AND si.Inquiry_intID = @InquiryID
+	    	GROUP BY t.Item_strItemId,t.Location_strCode	
+*/
+		-- First Pass to get TransI_dtmDateTime where Collected Date is NULL
+		SELECT 	t.Item_strItemId,
+	    		t.Location_strCode,
+	    		SUM((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END)) Quantity,
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * t.TransI_curValueEach / si.SaleUOMConv,@intRoundingSalesValue),0)) Value, 
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * t.TransI_decCostEach /*/ si.StockUOMConv*/,@CostCurrencyScale),0)) Cost,  
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/*/ si.StockUOMConv*/,@CostCurrencyScale),0)) NetCost,
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * (t.TransI_curValueEach - ISNULL(TransI_curSTaxEach,0) 
+	    			- ISNULL(TransI_curSTaxEach2,0)- ISNULL(TransI_curSTaxEach3,0)  - ISNULL(TransI_curSTaxEach4,0)  )
+	    			/ si.SaleUOMConv,@CurrencyScale),0))  Net,
+			--MP 2007/11/19 Added Nett Average Cost and Nett Last Cost
+			SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decAvgCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/*/ si.StockUOMConv*/,@CostCurrencyScale),0)) NetAverageCost,
+			SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decLastCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/*/ si.StockUOMConv*/,@CostCurrencyScale),0)) NetLastCost,
+			MAX (TransI_dtmDateTime) as LastTransDate
+	    	INTO #tmpOpeningCalc
+	    	FROM tblTrans_Inventory t
+	    	INNER JOIN tblStockInquiryConc si ON t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode
+	    	WHERE TransI_dtmDateTime > @MinLastStocktakeDate -- Use the Min Last Stocktake Date to speed up this query
+		AND TransI_dtmDateTime > si.LastStocktakeDate
+	    	AND TransI_dtmDateTime <= @FromDateTime
+		AND TransI_dtmDateCollected IS NULL
+	    	AND t.TransI_strType <> 'Z'
+		AND si.Item_strStocktakeable = 'Y'	-- Only need to work out an opening balance for Stocktakeable Items. Non Stocktakeable Items have there Last Stocktake Date set to the From date for this Query
+	    	AND si.Inquiry_intID = @InquiryID
+	    	GROUP BY t.Item_strItemId,t.Location_strCode	
+		-- Second Pass to get TransI_dtmDateCollected
+		SELECT 	t.Item_strItemId,
+	    		t.Location_strCode,
+	    		SUM((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END)) Quantity,
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * t.TransI_curValueEach / si.SaleUOMConv,@intRoundingSalesValue),0)) Value, 
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * t.TransI_decCostEach /*/ si.StockUOMConv*/,@CostCurrencyScale),0)) Cost,  
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/*/ si.StockUOMConv*/,@CostCurrencyScale),0)) NetCost,
+	    		SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * (t.TransI_curValueEach - ISNULL(TransI_curSTaxEach,0) 
+	    			- ISNULL(TransI_curSTaxEach2,0)- ISNULL(TransI_curSTaxEach3,0)  - ISNULL(TransI_curSTaxEach4,0)  )
+	    			/ si.SaleUOMConv,@CurrencyScale),0))  Net,
+			--MP 2007/11/19 Added Nett Average Cost and Nett Last Cost
+			SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decAvgCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/*/ si.StockUOMConv*/,@CostCurrencyScale),0)) NetAverageCost,
+			SUM(ISNULL(ROUND((CASE t.TransI_strType WHEN 'S' THEN -t.TransI_decNoOfItems WHEN 'B' THEN -t.TransI_decNoOfItems WHEN 'C' THEN  CASE t.TransI_strStatus WHEN 'W' THEN t.TransI_decNoOfItems ELSE - t.TransI_decNoOfItems END ELSE t.TransI_decNoOfItems END) * ISNULL( TransI_decLastCostEachNett,  (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+	    				/*/ si.StockUOMConv*/,@CostCurrencyScale),0)) NetLastCost,
+			MAX (TransI_dtmDateTime) as LastTransDate
+	    	INTO #tmpOpeningCalcCollected
+	    	FROM tblTrans_Inventory t
+	    	INNER JOIN tblStockInquiryConc si ON t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode
+	    	WHERE TransI_dtmDateCollected > @MinLastStocktakeDate  -- Use the Min Last Stocktake Date to speed up this query
+		AND  TransI_dtmDateCollected > si.LastStocktakeDate
+	    	AND TransI_dtmDateCollected <= @FromDateTime
+	    	AND t.TransI_strType <> 'Z'
+		AND si.Item_strStocktakeable = 'Y'	-- Only need to work out an opening balance for Stocktakeable Items. Non Stocktakeable Items have there Last Stocktake Date set to the From date for this Query
+	    	AND si.Inquiry_intID = @InquiryID
+	    	GROUP BY t.Item_strItemId,t.Location_strCode	
+	END
+  	-- Update Quantity, Value, Cost of the Transactions between LastStockTakeDate and FromDate of the report if any exist
+ 	if exists (select * from tempdb.dbo.sysobjects where id = object_id('tempdb.dbo.#tmpOpeningCalc') and sysstat & 0xf = 3)
+ 	BEGIN
+ 		UPDATE tblStockInquiryConc
+ 		SET 	OpeningQty = OpeningQty + sm.Quantity,
+ 			OpeningCost = OpeningCost + sm.NetCost,
+ 			OpeningQtyStockUOM1 = OpeningQtyStockUOM1 +  sm.Quantity / si.StockUOMConv,
+			OpeningAverageNettCost = OpeningAverageNettCost + sm.NetAverageCost,
+			OpeningLastNettCost = OpeningLastNettCost + sm.NetLastCost,
+			LastTransactionDate = LastTransDate
+ 		FROM tblStockInquiryConc as si, #tmpOpeningCalc sm
+ 		WHERE sm.Item_strItemId = si.Item_strCode
+ 		AND sm.Location_strCode = si.Location_strCode
+ 		AND si.Inquiry_intID = @InquiryID
+ 
+ 		DROP TABLE #tmpOpeningCalc
+ 	END
+	-- Update Quantity, Value, Cost of the Transactions between LastStockTakeDate and FromDate of the report if any exist
+ 	if exists (select * from tempdb.dbo.sysobjects where id = object_id('tempdb.dbo.#tmpOpeningCalcCollected') and sysstat & 0xf = 3)
+ 	BEGIN
+ 		UPDATE tblStockInquiryConc
+ 		SET 	OpeningQty = OpeningQty + sm.Quantity,
+ 			OpeningCost = OpeningCost + sm.NetCost,
+ 			OpeningQtyStockUOM1 = OpeningQtyStockUOM1 +  sm.Quantity / si.StockUOMConv,
+			OpeningAverageNettCost = OpeningAverageNettCost + sm.NetAverageCost,
+			OpeningLastNettCost = OpeningLastNettCost + sm.NetLastCost,
+			LastTransactionDate = CASE WHEN LastTransactionDate < LastTransDate THEN LastTransDate ELSE LastTransactionDate END
+ 		FROM tblStockInquiryConc as si, #tmpOpeningCalcCollected sm
+ 		WHERE sm.Item_strItemId = si.Item_strCode
+ 		AND sm.Location_strCode = si.Location_strCode
+ 		AND si.Inquiry_intID = @InquiryID
+ 
+ 		DROP TABLE #tmpOpeningCalcCollected
+ 	END
+	SET @SelectionStart = @FromDateTime 
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Calculating Opening Balance Took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+	-- Work out the Last Cost and Average Cost of the Last Transaction in the Period prior to the Current Reporting Period
+	UPDATE tblStockInquiryConc
+	SET 	Item_decNetLastCostPreReportPeriod =  ISNULL(i.TransI_decLastCostEachNett, (i.TransI_decCostEach - ISNULL(i.TransI_decSTaxCostEach,0) - ISNULL(i.TransI_decSTaxCostEach2,0) - ISNULL(i.TransI_decSTaxCostEach3,0) - ISNULL(i.TransI_decSTaxCostEach4,0))),
+		Item_decNetAverageCostPreReportPeriod = ISNULL(i.TransI_decAvgCostEachNett, (i.TransI_decCostEach - ISNULL(i.TransI_decSTaxCostEach,0) - ISNULL(i.TransI_decSTaxCostEach2,0) - ISNULL(i.TransI_decSTaxCostEach3,0) - ISNULL(i.TransI_decSTaxCostEach4,0)))
+	FROM tblStockInquiryConc as si, tblTrans_Inventory i
+	WHERE i.Item_strItemId = si.Item_strCode
+	AND i.Location_strCode = si.Location_strCode
+	AND i.TransI_dtmDateTime = LastTransactionDate 
+	AND si.Inquiry_intID = @InquiryID
+	-- For any of the Last Cost and Average Cost of the Last Transaction in the Period are NULL, this means there were no transactions
+	UPDATE tblStockInquiryConc
+	SET 	Item_decNetLastCostPreReportPeriod =  0
+	WHERE Item_decNetLastCostPreReportPeriod IS NULL
+	AND Inquiry_intID = @InquiryID
+	UPDATE tblStockInquiryConc
+	SET 	Item_decNetAverageCostPreReportPeriod = 0
+	WHERE Item_decNetAverageCostPreReportPeriod IS NULL
+	AND Inquiry_intID = @InquiryID
+	
+	-- If in Debug Mode, then Print out Debugging info
+	IF @DebugMode = 'Y'
+	BEGIN
+		PRINT 'Working out Last Average Cost from Period Prior to this Report Period Took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+		SET @StartTime = dbo.GetLocalDate()
+	END
+	SET @SelectionStart = @FromDateTime 
+	
+END
+ELSE
+BEGIN
+	IF NOT(@LastTransaction IS NULL)
+    SET @UseFromDate = 'Y'
+ ELSE
+ 	BEGIN
+  		SET @LastTransaction = @FromDateTime
+	 END
+	SET @SelectionStart = @LastTransaction
+	
+	--Print @LastTransaction
+END
+-----------------------------------------------------------------------------------------------------------------------
+-- GETTING MOVEMENTS BETWEEN THE START DATE AND THE END DATE OF THE QUERY
+-----------------------------------------------------------------------------------------------------------------------
+-- If in Debug Mode, then Print out Debugging info
+IF @DebugMode = 'Y'
+BEGIN
+	PRINT 'Starting Stock Movement Calculations: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+	SET @StartTime = dbo.GetLocalDate()
+END
+-- First Create the Temporary Table with Dummy Data and then clear it out
+SELECT 'QUERY_RESULTS_EXTRASPACE' Identifier,
+ t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode,
+ SUM(t.TransI_decNoOfItems) Quantity,
+ SUM(t.TransI_decNoOfItems) NegativeQuantities,
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_curValueEach,@intRoundingSalesValue),0)) Value, 
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_decCostEach,@CostCurrencyScale),0)) Cost,  
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0))
+		,@CostCurrencyScale),0)) NetCost,
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0))
+		,@CostCurrencyScale),0)) NegativeNetCosts,
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_curValueEach - ISNULL(TransI_curSTaxEach,0) 
+	- ISNULL(TransI_curSTaxEach2,0)- ISNULL(TransI_curSTaxEach3,0)  - ISNULL(TransI_curSTaxEach4,0) ),@CurrencyScale),0)) Net,
+TransI_dtmDateTime LastTrans,
+-- MP 2007/11/21 V3R3 Enhancements for Average and Last Cost
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+		,@CostCurrencyScale),0)) NetAverageCost,
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+		,@CostCurrencyScale),0)) PrevNetAverageCost,
+ SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decLastCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+		,@CostCurrencyScale),0)) NetLastCost
+INTO #tmpInventory 
+FROM tblTrans_Inventory t 
+WHERE TransI_lgnNumber = (SELECT MIN(TransI_lgnNumber) FROM tblTrans_Inventory)
+GROUP BY t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode, TransI_dtmDateTime
+-- Clear out the Table now it has been created
+DELETE #tmpInventory
+IF @DebugMode = 'Y'
+BEGIN
+	PRINT 'Created Temp Table: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+	SET @StartTime = dbo.GetLocalDate()
+END
+-- If Using a From Date, then don't need to join on tblStockInquiryConc, so use a different query to speed things up
+IF @UseFromDate = 'Y'
+BEGIN
+	/*INSERT INTO #tmpInventory(
+			Identifier,
+			TransI_strType,
+			Item_strItemId,
+			TransI_strStatus,
+			Location_strCode,
+			Quantity,
+			Value,
+			Cost,
+			NetCost,
+			Net,
+			LastTrans,
+			NetAverageCost,
+			NetLastCost
+			)
+		SELECT 'QUERY_RESULTS',
+		 	t.TransI_strType,
+			t.Item_strItemId,
+			t.TransI_strStatus,
+			t.Location_strCode,
+			SUM(t.TransI_decNoOfItems),
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_curValueEach / i.Item_curSaleUOMConv,@intRoundingSalesValue ),0)), 
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_decCostEach,@CostCurrencyScale),0)),  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_curValueEach - ISNULL(TransI_curSTaxEach,0) 
+			- ISNULL(TransI_curSTaxEach2,0)- ISNULL(TransI_curSTaxEach3,0)  - ISNULL(TransI_curSTaxEach4,0)  )
+			/ i.Item_curSaleUOMConv,@CurrencyScale),0)),
+			MAX (TransI_dtmDateTime),
+			-- MP 2007/11/21 V3R3 Enhancements for Average and Last Cost
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decLastCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0))
+		FROM tblTrans_Inventory t
+		INNER JOIN tblItem i ON t.Item_strItemId = i.Item_strItemId
+	        /************************************************************************/
+		/* THIS NEEDS FIXING							*/
+		/* Should be:								*/
+		/* 	WHERE	 (TransI_dtmDateTime > @SelectionStart 
+			AND TransI_dtmDateTime <= @ToDateTime
+			AND TransI_dtmDateCollected IS NULL) OR (TransI_dtmDateCollected > @SelectionStart AND TransI_dtmDateCollected <= @ToDateTime)
+		  BUT THIS IS TO SLOW BECAUSE WE CANNOT INDEX HINT? NEED SOMEONE WITH GOOD SQL SKILLS TO MAKE IT FAST!
+		*/
+		WHERE	 TransI_dtmDateTime > @SelectionStart 
+		AND TransI_dtmDateTime <= @ToDateTime
+		AND (TransI_dtmDateCollected IS NULL OR (TransI_dtmDateCollected > @SelectionStart AND TransI_dtmDateCollected <= @ToDateTime))
+		GROUP BY t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode
+	*/
+	-- First Pass to get Transactions based on TransI_dtmDateTime where TransI_dtmCollectedDate is NULL
+	INSERT INTO #tmpInventory(
+			Identifier,
+			TransI_strType,
+			Item_strItemId,
+			TransI_strStatus,
+			Location_strCode,
+			Quantity,
+			NegativeQuantities,
+			Value,
+			Cost,
+			NetCost,
+			NegativeNetCosts,
+			Net,
+			LastTrans,
+			NetAverageCost,
+			PrevNetAverageCost,
+			NetLastCost
+			)
+		SELECT 'QUERY_RESULTS',
+		 	t.TransI_strType,
+			t.Item_strItemId,
+			t.TransI_strStatus,
+			t.Location_strCode,
+			SUM(t.TransI_decNoOfItems),
+			
+			SUM( CASE WHEN t.TransI_decNoOfItems < 0 THEN t.TransI_decNoOfItems
+			          WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0 THEN t.TransI_decNoOfItems * -1
+			          ELSE 0
+			          END ),  -- NegativeQuantities
+			          
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_curValueEach / i.Item_curSaleUOMConv,@intRoundingSalesValue ),0)), 
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_decCostEach,@CostCurrencyScale),0)),  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+				
+		 	SUM(ISNULL(ROUND(
+		 	  CASE WHEN t.TransI_decNoOfItems < 0
+		 	         THEN t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0
+		 	         THEN -1 * t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       ELSE 0
+			       END,
+			  @CostCurrencyScale),0)),  -- NegativeNetCosts
+			  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_curValueEach - ISNULL(t.TransI_curSTaxEach,0) 
+			- ISNULL(t.TransI_curSTaxEach2,0)- ISNULL(t.TransI_curSTaxEach3,0)  - ISNULL(t.TransI_curSTaxEach4,0)  )
+			/ i.Item_curSaleUOMConv,@CurrencyScale),0)),
+			MAX (t.TransI_dtmDateTime),
+			-- MP 2007/11/21 V3R3 Enhancements for Average and Last Cost
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t2.TransI_decAvgCostEachNett,(t2.TransI_decCostEach - ISNULL(t2.TransI_decSTaxCostEach,0) - ISNULL(t2.TransI_decSTaxCostEach2,0) - ISNULL(t2.TransI_decSTaxCostEach3,0) - ISNULL(t2.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),  -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decLastCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0))
+		FROM tblTrans_Inventory t
+		INNER JOIN tblItem i ON i.Item_strItemId = t.Item_strItemId
+    -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+		LEFT  JOIN tblTrans_Inventory t2 ON t2.TransI_lgnNumber = t.TransI_lgnNumber AND t2.TransI_intSequence = t.TransI_intSequence - 1
+		WHERE	 t.TransI_dtmDateTime > @SelectionStart 
+		AND  t.TransI_dtmDateTime <= @ToDateTime
+		AND t.TransI_dtmDateCollected IS NULL
+		GROUP BY t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode
+    OPTION	(RECOMPILE)
+	-- Second Pass to get Transactions based on TransI_dtmCollectedDate 
+	INSERT INTO #tmpInventory(
+			Identifier,
+			TransI_strType,
+			Item_strItemId,
+			TransI_strStatus,
+			Location_strCode,
+			Quantity,
+			NegativeQuantities,
+			Value,
+			Cost,
+			NetCost,
+			NegativeNetCosts,
+			Net,
+			LastTrans,
+			NetAverageCost,
+			PrevNetAverageCost,
+			NetLastCost
+			)
+		SELECT 'QUERY_RESULTS',
+		 	t.TransI_strType,
+			t.Item_strItemId,
+			t.TransI_strStatus,
+			t.Location_strCode,
+			SUM(t.TransI_decNoOfItems),
+			
+			SUM( CASE WHEN t.TransI_decNoOfItems < 0 THEN t.TransI_decNoOfItems
+			          WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0 THEN t.TransI_decNoOfItems * -1
+			          ELSE 0
+			          END ),  -- NegativeQuantities
+			          
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_curValueEach / i.Item_curSaleUOMConv,@intRoundingSalesValue ),0)), 
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_decCostEach,@CostCurrencyScale),0)),  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+				
+		 	SUM(ISNULL(ROUND(
+		 	  CASE WHEN t.TransI_decNoOfItems < 0
+		 	         THEN t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0
+		 	         THEN -1 * t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       ELSE 0
+			       END,
+			  @CostCurrencyScale),0)),  -- NegativeNetCosts
+			  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_curValueEach - ISNULL(t.TransI_curSTaxEach,0) 
+			- ISNULL(t.TransI_curSTaxEach2,0)- ISNULL(t.TransI_curSTaxEach3,0)  - ISNULL(t.TransI_curSTaxEach4,0)  )
+			/ i.Item_curSaleUOMConv,@CurrencyScale),0)),
+			MAX (t.TransI_dtmDateTime),
+			-- MP 2007/11/21 V3R3 Enhancements for Average and Last Cost
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t2.TransI_decAvgCostEachNett,(t2.TransI_decCostEach - ISNULL(t2.TransI_decSTaxCostEach,0) - ISNULL(t2.TransI_decSTaxCostEach2,0) - ISNULL(t2.TransI_decSTaxCostEach3,0) - ISNULL(t2.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),  -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decLastCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0))
+		FROM tblTrans_Inventory t
+		INNER JOIN tblItem i ON i.Item_strItemId = t.Item_strItemId 
+    -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+		LEFT  JOIN tblTrans_Inventory t2 ON t2.TransI_lgnNumber = t.TransI_lgnNumber AND t2.TransI_intSequence = t.TransI_intSequence - 1
+		WHERE	 t.TransI_dtmDateCollected > @SelectionStart 
+		AND t.TransI_dtmDateCollected <= @ToDateTime
+		GROUP BY t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode
+    OPTION	(RECOMPILE)
+END
+ELSE
+BEGIN
+-- If From Date is Null, then opening date for each item depends on the items last stocktake date. So need to join on tblStockInquiryConc
+	/*INSERT INTO #tmpInventory(
+			Identifier,
+			TransI_strType,
+			Item_strItemId,
+			TransI_strStatus,
+			Location_strCode,
+			Quantity,
+			Value,
+			Cost,
+			NetCost,
+			Net,
+			LastTrans,
+			NetAverageCost,
+			NetLastCost
+			)
+		SELECT 'QUERY_RESULTS',
+		 	t.TransI_strType,
+			t.Item_strItemId,
+			t.TransI_strStatus,
+			t.Location_strCode,
+			SUM(t.TransI_decNoOfItems),
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_curValueEach / i.Item_curSaleUOMConv,@intRoundingSalesValue ),0)), 
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_decCostEach,@CostCurrencyScale),0)),  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_curValueEach - ISNULL(TransI_curSTaxEach,0) 
+			- ISNULL(TransI_curSTaxEach2,0)- ISNULL(TransI_curSTaxEach3,0)  - ISNULL(TransI_curSTaxEach4,0)  )
+			/ i.Item_curSaleUOMConv,@CurrencyScale),0)),
+			MAX (TransI_dtmDateTime),
+			-- MP 2007/11/21 V3R3 Enhancements for Average and Last Cost
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(TransI_decLastCostEachNett,(t.TransI_decCostEach - ISNULL(TransI_decSTaxCostEach,0) - ISNULL(TransI_decSTaxCostEach2,0) - ISNULL(TransI_decSTaxCostEach3,0) - ISNULL(TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0))
+		FROM tblTrans_Inventory t 
+		INNER JOIN tblItem i ON t.Item_strItemId = i.Item_strItemId
+	        INNER JOIN tblStockInquiryConc SI ON t.Item_strItemId = SI.Item_strCode AND SI.Location_strCode = t.Location_strCode
+		 /************************************************************************/
+		/* THIS NEEDS FIXING							*/
+		/* Should be:								*/
+		/* 	WHERE	 (TransI_dtmDateTime > SI.LastStocktakeDate 
+			AND TransI_dtmDateTime <= @ToDateTime
+			AND TransI_dtmDateCollected IS NULL) OR (TransI_dtmDateCollected > SI.LastStocktakeDate AND TransI_dtmDateCollected <= @ToDateTime)
+		  BUT THIS IS TO SLOW BECAUSE WE CANNOT INDEX HINT? NEED SOMEONE WITH GOOD SQL SKILLS TO MAKE IT FAST!
+		*/
+		WHERE	 TransI_dtmDateTime > SI.LastStocktakeDate 
+		AND TransI_dtmDateTime <= @ToDateTime
+		AND (TransI_dtmDateCollected IS NULL OR (TransI_dtmDateCollected > SI.LastStocktakeDate AND TransI_dtmDateCollected <= @ToDateTime))
+	 	AND SI.Inquiry_intID = @InquiryID
+		GROUP BY t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode
+	*/
+		-- First Pass to get Transactions based on TransI_dtmDateTime where TransI_dtmCollectedDate is NULL
+		INSERT INTO #tmpInventory(
+			Identifier,
+			TransI_strType,
+			Item_strItemId,
+			TransI_strStatus,
+			Location_strCode,
+			Quantity,
+			NegativeQuantities,
+			Value,
+			Cost,
+			NetCost,
+			NegativeNetCosts,
+			Net,
+			LastTrans,
+			NetAverageCost,
+			PrevNetAverageCost,
+			NetLastCost
+			)
+		SELECT 'QUERY_RESULTS',
+		 	t.TransI_strType,
+			t.Item_strItemId,
+			t.TransI_strStatus,
+			t.Location_strCode,
+			SUM(t.TransI_decNoOfItems),
+			
+			SUM( CASE WHEN t.TransI_decNoOfItems < 0 THEN t.TransI_decNoOfItems
+			          WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0 THEN t.TransI_decNoOfItems * -1
+			          ELSE 0
+			          END ),  -- NegativeQuantities
+			          
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_curValueEach / SI.SaleUOMConv,@intRoundingSalesValue ),0)), 
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_decCostEach,@CostCurrencyScale),0)),  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+				
+		 	SUM(ISNULL(ROUND(
+		 	  CASE WHEN t.TransI_decNoOfItems < 0
+		 	         THEN t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0
+		 	         THEN -1 * t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       ELSE 0
+			       END,
+			  @CostCurrencyScale),0)),  -- NegativeNetCosts
+			  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_curValueEach - ISNULL(t.TransI_curSTaxEach,0) 
+			- ISNULL(t.TransI_curSTaxEach2,0)- ISNULL(t.TransI_curSTaxEach3,0)  - ISNULL(t.TransI_curSTaxEach4,0)  )
+			/ SI.SaleUOMConv,@CurrencyScale),0)),
+			MAX (t.TransI_dtmDateTime),
+			-- MP 2007/11/21 V3R3 Enhancements for Average and Last Cost
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t2.TransI_decAvgCostEachNett,(t2.TransI_decCostEach - ISNULL(t2.TransI_decSTaxCostEach,0) - ISNULL(t2.TransI_decSTaxCostEach2,0) - ISNULL(t2.TransI_decSTaxCostEach3,0) - ISNULL(t2.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),  -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decLastCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0))
+		FROM tblTrans_Inventory t 
+		INNER JOIN tblStockInquiryConc SI ON t.Item_strItemId = SI.Item_strCode AND SI.Location_strCode = t.Location_strCode
+    -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+		LEFT  JOIN tblTrans_Inventory t2 ON t2.TransI_lgnNumber = t.TransI_lgnNumber AND t2.TransI_intSequence = t.TransI_intSequence - 1
+		WHERE t.TransI_dtmDateTime > @MinLastStocktakeDate -- Use the Min Last Stocktake Date to speed up this query
+		AND t.TransI_dtmDateTime > SI.LastStocktakeDate 
+		AND t.TransI_dtmDateTime <= @ToDateTime
+		AND t.TransI_dtmDateCollected IS NULL		
+	 	AND SI.Inquiry_intID = @InquiryID
+		GROUP BY t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode
+    OPTION	(RECOMPILE)
+		-- Second Pass to get Transactions based on TransI_dtmCollectedDate
+		INSERT INTO #tmpInventory(
+			Identifier,
+			TransI_strType,
+			Item_strItemId,
+			TransI_strStatus,
+			Location_strCode,
+			Quantity,
+			NegativeQuantities,
+			Value,
+			Cost,
+			NetCost,
+			NegativeNetCosts,
+			Net,
+			LastTrans,
+			NetAverageCost,
+			PrevNetAverageCost,
+			NetLastCost
+			)
+		SELECT 'QUERY_RESULTS',
+		 	t.TransI_strType,
+			t.Item_strItemId,
+			t.TransI_strStatus,
+			t.Location_strCode,
+			SUM(t.TransI_decNoOfItems),
+			
+			SUM( CASE WHEN t.TransI_decNoOfItems < 0 THEN t.TransI_decNoOfItems
+			          WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0 THEN t.TransI_decNoOfItems * -1
+			          ELSE 0
+			          END ),  -- NegativeQuantities
+			          
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_curValueEach / SI.SaleUOMConv,@intRoundingSalesValue ),0)), 
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * t.TransI_decCostEach,@CostCurrencyScale),0)),  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+				
+		 	SUM(ISNULL(ROUND(
+		 	  CASE WHEN t.TransI_decNoOfItems < 0
+		 	         THEN t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       WHEN t.TransI_strType IN ('B','C','S') AND t.TransI_strStatus <> 'W' AND t.TransI_decNoOfItems > 0
+		 	         THEN -1 * t.TransI_decNoOfItems * ISNULL(t.TransI_decCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+			       ELSE 0
+			       END,
+			  @CostCurrencyScale),0)),  -- NegativeNetCosts
+			  
+		 	SUM(ISNULL(ROUND(t.TransI_decNoOfItems * (t.TransI_curValueEach - ISNULL(t.TransI_curSTaxEach,0) 
+			- ISNULL(t.TransI_curSTaxEach2,0)- ISNULL(t.TransI_curSTaxEach3,0)  - ISNULL(t.TransI_curSTaxEach4,0)  )
+			/ SI.SaleUOMConv,@CurrencyScale),0)),
+			MAX (t.TransI_dtmDateTime),
+			-- MP 2007/11/21 V3R3 Enhancements for Average and Last Cost
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decAvgCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t2.TransI_decAvgCostEachNett,(t2.TransI_decCostEach - ISNULL(t2.TransI_decSTaxCostEach,0) - ISNULL(t2.TransI_decSTaxCostEach2,0) - ISNULL(t2.TransI_decSTaxCostEach3,0) - ISNULL(t2.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0)),  -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+			SUM(ISNULL(ROUND(t.TransI_decNoOfItems * ISNULL(t.TransI_decLastCostEachNett,(t.TransI_decCostEach - ISNULL(t.TransI_decSTaxCostEach,0) - ISNULL(t.TransI_decSTaxCostEach2,0) - ISNULL(t.TransI_decSTaxCostEach3,0) - ISNULL(t.TransI_decSTaxCostEach4,0)))
+				,@CostCurrencyScale),0))
+		FROM tblTrans_Inventory t 
+		INNER JOIN tblStockInquiryConc SI ON t.Item_strItemId = SI.Item_strCode AND SI.Location_strCode = t.Location_strCode
+    -- MVW  01 Apr 2016  B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+		LEFT  JOIN tblTrans_Inventory t2 ON t2.TransI_lgnNumber = t.TransI_lgnNumber AND t2.TransI_intSequence = t.TransI_intSequence - 1
+		WHERE t.TransI_dtmDateCollected > @MinLastStocktakeDate -- Use the Min Last Stocktake Date to speed up this query
+		AND t.TransI_dtmDateCollected > SI.LastStocktakeDate 
+		AND t.TransI_dtmDateCollected <= @ToDateTime
+		AND SI.Inquiry_intID = @InquiryID
+		GROUP BY t.TransI_strType,t.Item_strItemId,t.TransI_strStatus,t.Location_strCode
+    OPTION	(RECOMPILE)
+END
+IF @DebugMode = 'Y'
+BEGIN
+	PRINT 'Collected Movements into a Temporary Table: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+	SET @StartTime = dbo.GetLocalDate()
+END
+UPDATE #tmpInventory
+SET 	Quantity = - Quantity,
+	Value = - Value,
+	Cost = - Cost,
+	NetCost = - NetCost,
+	Net = - Net,
+	NetAverageCost = - NetAverageCost,
+	NetLastCost = - NetLastCost
+WHERE TransI_strType IN ('B','C','S')
+	AND TransI_strStatus <> 'W'
+-- MP 2008/05/12
+-- Split out External Transfers because Average Cost of Transfer INCOMING should be at Last Cost (i.e. The Actual transaction Value)
+-- Only reciepts and Transfers In, and To Location Transfers are handled this way.
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'TRANS_EXT_OUTGOING','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('U')
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'TRANS_EXT_INCOMING','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('N')
+GROUP BY Item_strItemId, Location_strCode
+-- MP 2008/05/12
+-- Split out Internal Transfers because Average Cost of Transfer To Location should be at Last Cost (i.e. The Actual transaction Value)
+-- Only reciepts and Transfers In, and To Location Transfers are handled this way.
+-- MVW 15 Mar 2016 B94211  TransferIntAverageNettCost for "Transfers Internal - To Location": Use NetAverageCost from previous record
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, PrevNetAverageCost, NetLastCost)
+SELECT 'TRANS_INT_TOLOCATION','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(PrevNetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('T')
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'TRANS_INT_FROMLOCATION','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('F')
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'ADJUSTMENTS','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('I','D')
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'WASTAGE','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE (TransI_strType = 'W' OR (TransI_strType = 'C' AND TransI_strStatus = 'W'))
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'ITEMS_MADE_PARENT','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('A')
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'ITEMS_MADE_COMPONENT','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('B')
+GROUP BY Item_strItemId, Location_strCode
+-- First just select Type S transactions (Parent Item Sold)
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'OVER_COUNTER','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType = 'S'
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'LAST COST','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('U','N')
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'USAGE','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType IN ('B', 'C')
+AND   TransI_strStatus <> 'W'
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'COMPNTS_SOLD','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType = 'C'
+AND   TransI_strStatus <> 'W'
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'RECEIPTS','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType = 'R'
+GROUP BY Item_strItemId, Location_strCode
+Insert INTO #tmpInventory 
+(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+Quantity,NegativeQuantities,Value,Cost,NetCost,NegativeNetCosts,Net,LastTrans, NetAverageCost, NetLastCost)
+SELECT 'STOCKADJUST','',Item_strItemId,'',Location_strCode,
+SUM(Quantity),SUM(NegativeQuantities),SUM(Value),SUM(Cost),SUM(NetCost),SUM(NegativeNetCosts),Sum(Net),MAX(LastTrans), SUM(NetAverageCost), SUM(NetLastCost)
+FROM #tmpInventory
+WHERE TransI_strType = 'O'
+GROUP BY Item_strItemId, Location_strCode
+-- If in Debug Mode, then Print out Debugging info
+IF @DebugMode = 'Y'
+BEGIN
+	PRINT 'Working out Stock Movements Took: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+	SET @StartTime = dbo.GetLocalDate()
+END
+	-- Now get type C transactions (Component Item Sold)
+	-- Find the parent item that is not a Combo item (Look at combo flag)
+	-- In the Parents Recipe, find the location of the component. If location is blank, then this is the control item
+	
+/*
+	Insert INTO #tmpInventory 
+	(Identifier,TransI_strType,Item_strItemId,TransI_strStatus,Location_strCode,
+	Quantity,Value,Cost,NetCost,Net,LastTrans)
+	SELECT 'OVER_COUNTER','',tInv.Item_strItemId,'',tInv.Location_strCode,
+	SUM(Quantity),SUM(Value),SUM(Cost),SUM(NetCost),Sum(Net),MAX(LastTrans)
+	FROM #tmpInventory tInv, tblBOM bom, tblItem item
+	WHERE tInv.Item_strItemId = bom.BOM_strItemId
+	AND bom.Item_strItemId = item.Item_strItemId
+	AND bom.Location_strCode IS NULL
+	AND item.Item_strCombo = 'Y'
+	AND tInv.TransI_strType = 'C' AND tInv.TransI_strStatus <> 'W'
+Select * from tblItem
+Select * from tblBOM
+	tInv.TransI_strType = 'C' AND tInv.TransI_strStatus <> 'W'
+	
+	GROUP BY tInv.Item_strItemId, tInv.Location_strCode
+*/
+--select * from #tmpInventory
+--Update header record with last transaction time found
+IF (SELECT MAX(LastTrans) FROM #tmpInventory) IS NOT NULL 
+UPDATE tblStockInquiryConcHeader
+SET LastTransDateTime = (SELECT MAX(LastTrans) FROM #tmpInventory)
+WHERE Inquiry_intID = @InquiryID
+UPDATE tblStockInquiryConcHeader
+SET   RunDateTime = dbo.GetLocalDate()
+WHERE Inquiry_intID = @InquiryID
+UPDATE tblStockInquiryConcHeader
+SET AppendExisting = @AppendExisting
+WHERE Inquiry_intID = @InquiryID
+-- Receipts
+UPDATE tblStockInquiryConc
+SET 	ReceivedQty = ReceivedQty + t.Quantity,
+	ReceivedCost = ReceivedCost + t.NetCost,
+	-- MP 2008/05/12 Changed Average Received Net Cost to be the Actual Received Cost of the transaction and not the Weighted Average at the Time of the transaction (This is the Last Cost)
+	--ReceivedAverageNettCost = ReceivedAverageNettCost + t.NetAverageCost,
+	ReceivedAverageNettCost = ReceivedLastNettCost + t.NetLastCost,
+	ReceivedLastNettCost = ReceivedLastNettCost + t.NetLastCost,
+	ReceivedQtyStockUOM1 = ReceivedQtyStockUOM1 + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'RECEIPTS'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+/*
+UPDATE tblStockInquiryConc
+SET 	ReceivedQty = ISNULL(ReceivedQty,0) + t.Quantity,
+	ReceivedCost = ISNULL(ReceivedCost,0) + t.NetCost,
+	--ReceivedAverageNettCost = ReceivedAverageNettCost + t.NetAverageCost,
+	--ReceivedLastNettCost = ReceivedLastNettCost + t.NetLastCost,
+	ReceivedQtyStockUOM1 = ISNULL(ReceivedQtyStockUOM1,0) + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.TransI_strType = 'R'--IN ('A', 'R')	--Including Parent Items Made?
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+*/
+-- Transfers External - Leaving Cinema
+UPDATE tblStockInquiryConc
+SET 	TransferExtQty = TransferExtQty + t.Quantity,
+	TransferExtCost = TransferExtCost + t.NetCost,
+	TransferExtAverageNettCost = TransferExtAverageNettCost + t.NetAverageCost,
+	TransferExtLastNettCost = TransferExtLastNettCost + t.NetLastCost,
+	TransferExtQtyStockUOM1 = TransferExtQtyStockUOM1 + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'TRANS_EXT_OUTGOING'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+-- Transfers External - Entering Cinema
+UPDATE tblStockInquiryConc
+SET 	TransferExtQty = TransferExtQty + t.Quantity,
+	TransferExtCost = TransferExtCost + t.NetCost,
+	-- Handle Average Cost Differently. It is the actual Cost of the transaction (i.e. Last Cost)
+	TransferExtAverageNettCost =  TransferExtAverageNettCost + t.NetLastCost,  --NOTE: Taking the TransferExtAverageNettCost (which includes OUTGOING Above) and Add on Last Cost of INCOMING
+	TransferExtLastNettCost = TransferExtLastNettCost + t.NetLastCost,
+	TransferExtQtyStockUOM1 = TransferExtQtyStockUOM1 + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'TRANS_EXT_INCOMING'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+--Transfers Internal - From Location
+UPDATE tblStockInquiryConc
+SET 	TransferIntQty = TransferIntQty + t.Quantity,
+	TransferIntCost = TransferIntCost + t.NetCost,
+	TransferIntAverageNettCost = TransferIntAverageNettCost + t.NetAverageCost,
+	TransferIntLastNettCost = TransferIntLastNettCost + t.NetLastCost,
+	TransferIntQtyStockUOM1 = TransferIntQtyStockUOM1 + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'TRANS_INT_FROMLOCATION'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+--Transfers Internal - To Location
+UPDATE tblStockInquiryConc
+SET 	TransferIntQty = TransferIntQty + t.Quantity,
+	TransferIntCost = TransferIntCost + t.NetCost,
+	-- Handle Average Cost Differently. It is the actual Cost of the transaction (i.e. Last Cost)
+	--TransferIntAverageNettCost = TransferIntAverageNettCost +  t.NetLastCost, -- NOTE: Taking the TransferIntAverageNettCost (which includes FROMLOCATION Above) and Add on Last Cost of TOLOCATION
+	TransferIntAverageNettCost = TransferIntAverageNettCost + t.PrevNetAverageCost, -- MVW 15 Mar 2016 B94211  Use NetAverageCost from previous record instead of NetLastCost
+	TransferIntLastNettCost = TransferIntLastNettCost + t.NetLastCost,
+	TransferIntQtyStockUOM1 = TransferIntQtyStockUOM1 + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'TRANS_INT_TOLOCATION'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+--Adjustments
+UPDATE tblStockInquiryConc
+SET 	AdjustmentsQty = AdjustmentsQty + t.Quantity,
+	AdjustmentsCost = AdjustmentsCost + t.NetCost,
+	AdjustmentsAverageNettCost = AdjustmentsAverageNettCost + t.NetAverageCost,
+	AdjustmentsLastNettCost = AdjustmentsLastNettCost + t.NetLastCost,
+	AdjustmentsQtyStockUOM1 = AdjustmentsQtyStockUOM1 + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'ADJUSTMENTS'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+/*
+--Over the Counter Usage (Sales)
+-- All Sales, but not for Made at Sale Time Parents
+UPDATE tblStockInquiryConc
+SET 	OverCounterQty = OverCounterQty - t.Quantity,
+	OverCounterCost = OverCounterCost - t.NetCost,
+	OverCounterQtyStockUOM1 = OverCounterQtyStockUOM1 - t.Quantity / si.StockUOMConv,
+	OverCounterGross = OverCounterGross + si.ActualSalesGross,
+	OverCounterNet = OverCounterNet + si.ActualSalesNet
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Item_strItemType <> 'S'
+AND t.TransI_strType = 'S'
+AND si.Inquiry_intID = @InquiryID
+*/
+-- The Over Counter Field is used on the Cost of Sales Report
+-- It includes the all Type C Transactions (Useage of Components) but not Wastage
+-- It should not include Items Made (B) because they are a seperate column on the cost of sales report
+UPDATE tblStockInquiryConc
+SET 	OverCounterQty = OverCounterQty - t.Quantity,
+	OverCounterCost = OverCounterCost - t.NetCost,
+	OverCounterAverageNettCost = OverCounterAverageNettCost - t.NetAverageCost,
+	OverCounterLastNettCost = OverCounterLastNettCost - t.NetLastCost,
+	OverCounterQtyStockUOM1 = OverCounterQtyStockUOM1 - t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'COMPNTS_SOLD'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+--Wastage
+UPDATE tblStockInquiryConc
+SET 	WastageQty = WastageQty - t.Quantity,
+	WastageCost = WastageCost - t.NetCost,
+	WastageAverageNettCost = WastageAverageNettCost - t.NetAverageCost,
+	WastageLastNettCost = WastageLastNettCost - t.NetLastCost,
+	WastageQtyStockUOM1 = WastageQtyStockUOM1 - t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'WASTAGE'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+-- Stocktake Adjustment
+UPDATE tblStockInquiryConc
+SET 	StocktakeAdjustQty = StocktakeAdjustQty - t.Quantity,
+	StocktakeAdjustCost = StocktakeAdjustCost - t.NetCost,
+	StocktakeAdjustAverageNettCost = StocktakeAdjustAverageNettCost - t.NetAverageCost,
+	StocktakeAdjustLastNettCost = StocktakeAdjustLastNettCost - t.NetLastCost,
+	StocktakeAdjustQtyStockUOM1 = StocktakeAdjustQtyStockUOM1 - t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'STOCKADJUST'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+-- Items Premade Parent
+UPDATE tblStockInquiryConc
+SET 	ItemsPremadeQty = ItemsPremadeQty - t.Quantity,
+	ItemsPremadeCost = ItemsPremadeCost - t.NetCost,
+	-- MP 2008/05/27 Changed Average Made Items Net Cost to be the Actual Cost of the transaction and not the Weighted Average at the Time of the transaction (This is the Last Cost)
+	-- Handle Average Cost Differently. It is the actual Cost of the transaction (i.e. Last Cost)
+	ItemsPremadeAverageNettCost = ItemsPremadeAverageNettCost - t.NetLastCost,
+	ItemsPremadeLastNettCost = ItemsPremadeLastNettCost - t.NetLastCost,
+	ItemsPremadeQtyStockUOM1 = ItemsPremadeQtyStockUOM1 - t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'ITEMS_MADE_PARENT'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+-- Items Premade Component
+UPDATE tblStockInquiryConc
+SET 	ItemsPremadeQty = ItemsPremadeQty - t.Quantity,
+	ItemsPremadeCost = ItemsPremadeCost - t.NetCost,
+	ItemsPremadeAverageNettCost = ItemsPremadeAverageNettCost - t.NetAverageCost,
+	ItemsPremadeLastNettCost = ItemsPremadeLastNettCost - t.NetLastCost,
+	ItemsPremadeQtyStockUOM1 = ItemsPremadeQtyStockUOM1 - t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'ITEMS_MADE_COMPONENT'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+-- Actual Sales 
+-- Parent Items only...no components
+UPDATE tblStockInquiryConc
+SET 	ActualSalesQty = ActualSalesQty - t.Quantity,
+	ActualSalesCost = ActualSalesCost - t.NetCost,
+	ActualSalesAverageNettCost = ActualSalesAverageNettCost - t.NetAverageCost,
+	ActualSalesLastNettCost = ActualSalesLastNettCost - t.NetLastCost,
+	ActualSalesQtyStockUOM1 = ActualSalesQtyStockUOM1 - t.Quantity / si.StockUOMConv,
+	ActualSalesGross = ActualSalesGross - t.Value,
+	ActualSalesNet = ActualSalesNet - t.Net
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'OVER_COUNTER'
+AND t.Item_strItemId = si.Item_strCode
+--AND t.TransI_strType = 'S'
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+-- Variance
+UPDATE tblStockInquiryConc
+SET 	VarianceQty = VarianceQty + t.Quantity,
+	VarianceCost = VarianceCost + t.NetCost,
+	NegativeVarianceQty = NegativeVarianceQty + t.NegativeQuantities,
+	NegativeVarianceCost = NegativeVarianceCost + t.NegativeNetCosts,
+	VarianceAverageNettCost = VarianceAverageNettCost + t.NetAverageCost,
+	VarianceLastNettCost = VarianceLastNettCost + t.NetLastCost,
+	VarianceQtyStockUOM1 = VarianceQtyStockUOM1 + t.Quantity / si.StockUOMConv
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'STOCKADJUST'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+/* Mark P Changed 01/07/2004
+-- Useage Quantity - Components are used
+UPDATE tblStockInquiryConc
+SET 	TotalUsageQty = TotalUsageQty - t.Quantity,
+	TotalUsageCost = TotalUsageCost - t.NetCost,
+	TotalUsageQtyStockUOM1 = TotalUsageQtyStockUOM1 - t.Quantity / si.StockUOMConv 
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE  t.Item_strItemId = si.Item_strCode
+AND t.TransI_strType = 'C' --AND t.TransI_strStatus <> 'W'
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+*/
+-- Useage Quantity - Components are used
+UPDATE tblStockInquiryConc
+SET 	TotalUsageQty = TotalUsageQty - t.Quantity,
+	TotalUsageCost = TotalUsageCost - t.NetCost,
+	TotalUsageAverageNettCost = TotalUsageAverageNettCost - t.NetAverageCost,
+	TotalUsageLastNettCost = TotalUsageLastNettCost - t.NetLastCost,
+	TotalUsageQtyStockUOM1 = TotalUsageQtyStockUOM1 - t.Quantity / si.StockUOMConv 
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE  t.Item_strItemId = si.Item_strCode
+AND t.Identifier = 'USAGE'
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+--Over Counter Quantity (Terminal Sales) For Parents
+UPDATE tblStockInquiryConc
+SET 	OverCounterQty = OverCounterQty + si.ActualSalesQty,
+	OverCounterCost = OverCounterCost + si.ActualSalesCost,
+	OverCounterAverageNettCost = OverCounterAverageNettCost - t.NetAverageCost,
+	OverCounterLastNettCost = OverCounterLastNettCost - t.NetLastCost,
+	OverCounterQtyStockUOM1 = OverCounterQtyStockUOM1 + si.ActualSalesQtyStockUOM1,
+	OverCounterGross = OverCounterGross + si.ActualSalesGross,
+	OverCounterNet = OverCounterNet + si.ActualSalesNet
+FROM tblStockInquiryConc as si, #tmpInventory t
+WHERE t.Identifier = 'OVER_COUNTER'
+AND t.Item_strItemId = si.Item_strCode
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+/* CONTROL ITEM CALCULATION FOR LOEWS. NO LONGER NEEDED */
+--Over Counter Quantity (Terminal Sales) For Control Components
+-- Shows there Parent Items Sales (For Lowes)
+/*
+UPDATE tblStockInquiryConc
+SET 	OverCounterParentQty = OverCounterParentQty - t.Quantity,
+	OverCounterParentCost = OverCounterParentCost - t.NetCost,
+	OverCounterParentQtyStockUOM1 = OverCounterParentQtyStockUOM1 - t.Quantity / si.StockUOMConv,
+	OverCounterParentGross = OverCounterParentGross  - ISNULL((SELECT ti.Value FROM #tmpInventory ti WHERE ti.Item_strItemId = bom.Item_strItemId AND ti.Location_strCode = si.Location_strCode AND ti.Identifier = 'QUERY_RESULTS'  AND ti.TransI_strType = 'S' AND ti.TransI_strStatus <> 'R'),0),
+	OverCounterParentNet = OverCounterParentNet - ISNULL((SELECT ti.Net FROM #tmpInventory ti WHERE ti.Item_strItemId = bom.Item_strItemId AND ti.Location_strCode = si.Location_strCode AND ti.Identifier = 'QUERY_RESULTS'  AND ti.TransI_strType = 'S' AND ti.TransI_strStatus <> 'R'),0),
+	OverCounterParentItem = bom.Item_strItemId
+FROM tblStockInquiryConc as si, #tmpInventory t,tblBOM bom, tblItem item
+WHERE  t.Item_strItemId = bom.BOM_strItemId
+AND bom.Item_strItemId = item.Item_strItemId
+AND bom.Location_strCode IS NULL
+AND (item.Item_strCombo = 'N' OR item.Item_strCombo IS NULL)
+AND t.Item_strItemId = si.Item_strCode
+AND t.TransI_strType = 'C' AND t.TransI_strStatus <> 'W'
+AND t.Location_strCode = si.Location_strCode
+AND si.Inquiry_intID = @InquiryID
+-- The The Parent Item Id for all control components
+UPDATE tblStockInquiryConc
+SET OverCounterParentItem = bom.Item_strItemId
+FROM tblStockInquiryConc as si, tblBOM bom, tblItem item
+WHERE si.Item_strCode = bom.BOM_strItemId
+AND bom.Item_strItemId = item.Item_strItemId
+AND bom.Location_strCode IS NULL
+AND (item.Item_strCombo = 'N' OR item.Item_strCombo IS NULL)
+AND si.Inquiry_intID = @InquiryID
+-- Where the Parent Item is not null, update the retail and cost prices to be those of its parents
+UPDATE tblStockInquiryConc 
+SET	Item_decCostPriceOverCounter = (SELECT sc.Item_decCostPriceOverCounter FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID),
+	Item_curRetailPriceOverCounter = (SELECT sc.Item_curRetailPriceOverCounter FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID),
+	Item_decNetCostPriceOverCounter = (SELECT sc.Item_decNetCostPriceOverCounter FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID),
+	Item_curNetRetailPriceOverCounter = (SELECT sc.Item_curNetRetailPriceOverCounter FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID)
+FROM tblStockInquiryConc as si
+WHERE si.Inquiry_intID = @InquiryID
+AND si.OverCounterParentItem IS NOT NULL
+*/
+/************************************************************************************************************************
+ LAST COST AND AVERAGE COST												
+************************************************************************************************************************/
+INSERT INTO #tmpInventory (
+	Identifier,
+	Item_strItemId,
+	Location_strCode,
+	LastTrans
+	)
+SELECT 'LASTRANS',
+	Item_strItemId,
+	Location_strCode,
+	MAX(LastTrans)
+FROM #tmpInventory
+GROUP BY Item_strItemId,
+	Location_strCode
+-- MP 2008/05/09
+-- Now update tblStockInquiry Conc with the last Transaction Date for each Item/Location. For any Item/Locations that do not have a transaction in this date range, then the Last Tranasction Date we found when calculating the Opening Balance should already be in this field.
+UPDATE tblStockInquiryConc
+SET LastTransactionDate = LastTrans
+FROM tblStockInquiryConc si,  #tmpInventory ti
+WHERE si.Item_strCode = ti.Item_strItemId 
+AND 	si.Location_strCode = ti.Location_strCode 
+AND	 ti.Identifier = 'LASTRANS'
+AND 	si.Inquiry_intID = @InquiryID
+-- Get the Last Cost, Standard Cost and Average Cost for Each Item, from the Last Transaction in the database
+/*UPDATE tblStockInquiryConc 
+SET	Item_decNetLastCost = (SELECT TOP 1 TransI_decLastCostEachNett FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = (SELECT ti.LastTrans FROM #tmpInventory ti WHERE si.Item_strCode = ti.Item_strItemId AND 	si.Location_strCode = ti.Location_strCode AND ti.Identifier = 'LASTRANS') AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),
+	Item_decNetAverageCost = (SELECT TOP 1 TransI_decAvgCostEachNett FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = (SELECT ti.LastTrans FROM #tmpInventory ti WHERE si.Item_strCode = ti.Item_strItemId AND 	si.Location_strCode = ti.Location_strCode AND ti.Identifier = 'LASTRANS') AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),
+	Item_decNetCostPrice = ISNULL((SELECT TOP 1 ISNULL(TransI_decCostEachNett, TransI_decCostEach - (TransI_decSTaxCostEach + TransI_decSTaxCostEach2 + TransI_decSTaxCostEach3 + TransI_decSTaxCostEach4))  FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = (SELECT ti.LastTrans FROM #tmpInventory ti WHERE si.Item_strCode = ti.Item_strItemId AND 	si.Location_strCode = ti.Location_strCode AND ti.Identifier = 'LASTRANS') AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),Item_decNetCostPrice),
+	Item_decCostPrice = ISNULL((SELECT TOP 1 TransI_decCostEach FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = (SELECT ti.LastTrans FROM #tmpInventory ti WHERE si.Item_strCode = ti.Item_strItemId AND 	si.Location_strCode = ti.Location_strCode AND ti.Identifier = 'LASTRANS') AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),Item_decCostPrice)
+FROM 	tblStockInquiryConc si
+WHERE	si.Inquiry_intID = @InquiryID
+*/
+UPDATE tblStockInquiryConc
+-- 30 Mar 2015  MVW  B65966  Index Hint "WITH (INDEX=indDateTime)" was causing poor performance
+SET	Item_decNetLastCost = (SELECT TOP 1 TransI_decLastCostEachNett FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),
+	Item_decNetAverageCost = (SELECT TOP 1 TransI_decAvgCostEachNett FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),
+	Item_decNetCostPrice = ISNULL((SELECT TOP 1 ISNULL(TransI_decCostEachNett, TransI_decCostEach - (TransI_decSTaxCostEach + TransI_decSTaxCostEach2 + TransI_decSTaxCostEach3 + TransI_decSTaxCostEach4))  FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),Item_decNetCostPrice),
+	Item_decCostPrice = ISNULL((SELECT TOP 1 TransI_decCostEach FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),Item_decCostPrice)
+--SET	Item_decNetLastCost = (SELECT TOP 1 TransI_decLastCostEachNett FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),
+--	Item_decNetAverageCost = (SELECT TOP 1 TransI_decAvgCostEachNett FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),
+--	Item_decNetCostPrice = ISNULL((SELECT TOP 1 ISNULL(TransI_decCostEachNett, TransI_decCostEach - (TransI_decSTaxCostEach + TransI_decSTaxCostEach2 + TransI_decSTaxCostEach3 + TransI_decSTaxCostEach4))  FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),Item_decNetCostPrice),
+--	Item_decCostPrice = ISNULL((SELECT TOP 1 TransI_decCostEach FROM tblTrans_Inventory t WHERE t.TransI_dtmDateTime = si.LastTransactionDate AND t.Item_strItemId = si.Item_strCode AND t.Location_strCode = si.Location_strCode),Item_decCostPrice)
+FROM 	tblStockInquiryConc si
+WHERE	si.Inquiry_intID = @InquiryID
+AND	si.LastTransactionDate IS NOT NULL
+-- If any of the Last Costs or Average Costs were NULL, Try using the Last Cost from the Last Stocktake prior to this period
+UPDATE tblStockInquiryConc
+SET	Item_decNetAverageCost = si.Item_decNetAverageCostPreReportPeriod
+FROM 	tblStockInquiryConc si
+WHERE	si.Item_decNetAverageCost IS NULL 
+AND	si.Inquiry_intID = @InquiryID
+UPDATE tblStockInquiryConc
+SET	Item_decNetLastCost = si.Item_decNetLastCostPreReportPeriod
+FROM 	tblStockInquiryConc si
+WHERE	si.Item_decNetLastCost IS NULL
+AND	si.Inquiry_intID = @InquiryID
+-- If any of the Last Costs or Average Costs are still NULL (i.e. No Transactions) Then just use the static cost price
+UPDATE tblStockInquiryConc
+SET	Item_decNetAverageCost = si.Item_decNetCostPrice
+FROM 	tblStockInquiryConc si
+WHERE	si.Item_decNetAverageCost IS NULL 
+AND	si.Inquiry_intID = @InquiryID
+UPDATE tblStockInquiryConc
+SET	Item_decNetLastCost = si.Item_decNetCostPrice
+FROM 	tblStockInquiryConc si
+WHERE	si.Item_decNetLastCost IS NULL
+AND	si.Inquiry_intID = @InquiryID
+/************************************************************************************************************************
+	AVERAGE RETAIL PRICE												
+************************************************************************************************************************/
+-- Get the Average Price For Each Item
+UPDATE tblStockInquiryConc
+SET	Item_curAveragePrice = CASE si.ActualSalesQty WHEN 0 THEN si.Item_curRetailPrice ELSE si.ActualSalesGross/ si.ActualSalesQty END,
+	Item_curNetAveragePrice = CASE si.ActualSalesQty WHEN 0 THEN si.Item_curNetRetailPrice ELSE si.ActualSalesNet/si.ActualSalesQty END
+FROM 	tblStockInquiryConc si
+WHERE	si.Inquiry_intID = @InquiryID
+-- IF any of the Average Prices were NULL (i.e. No Transactions) Then just use the static Prices
+-- Now done in the Case statement above MP(17/03/2005)
+/*
+UPDATE tblStockInquiryConc
+SET	Item_curAveragePrice = si.Item_curRetailPrice,
+	Item_curNetAveragePrice = si.Item_curNetRetailPrice
+FROM 	tblStockInquiryConc si
+WHERE	si.Inquiry_intID = @InquiryID
+AND	si.Item_curAveragePrice IS NULL OR si.Item_curNetAveragePrice IS NULL
+*/
+-- Now Update the OverCounter Figures
+UPDATE tblStockInquiryConc 
+SET	Item_decLastCostPriceOverCounter = (SELECT ISNULL(sc.Item_decLastCostPriceOverCounter, sc.Item_decCostPriceOverCounter) FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID),
+	Item_curAverageRetailPriceOverCounter = (SELECT ISNULL(sc.Item_curAverageRetailPriceOverCounter,sc.Item_curRetailPriceOverCounter) FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID),
+	Item_decNetLastCostPriceOverCounter = (SELECT ISNULL(sc.Item_decNetLastCostPriceOverCounter,sc.Item_decNetCostPriceOverCounter) FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID),
+	Item_curNetAverageRetailPriceOverCounter = (SELECT ISNULL(sc.Item_curNetAverageRetailPriceOverCounter, sc.Item_curNetRetailPriceOverCounter) FROM tblStockInquiryConc sc WHERE si.OverCounterParentItem = sc.Item_strCode AND si.Location_strCode = sc.Location_strCode AND si.Inquiry_intID = sc.Inquiry_intID)
+FROM tblStockInquiryConc as si
+WHERE si.Inquiry_intID = @InquiryID
+AND si.OverCounterParentItem IS NOT NULL
+-- Now update items with no parent item
+UPDATE tblStockInquiryConc 
+SET	Item_decLastCostPriceOverCounter = ISNULL(sc.Item_decLastCostPriceOverCounter, sc.Item_decCostPriceOverCounter),
+	Item_curAverageRetailPriceOverCounter = ISNULL(sc.Item_curAverageRetailPriceOverCounter,sc.Item_curRetailPriceOverCounter),
+	Item_decNetLastCostPriceOverCounter = ISNULL(sc.Item_decNetLastCostPriceOverCounter,sc.Item_decNetCostPriceOverCounter),
+	Item_curNetAverageRetailPriceOverCounter = ISNULL(sc.Item_curNetAverageRetailPriceOverCounter, sc.Item_curNetRetailPriceOverCounter)
+FROM tblStockInquiryConc as sc
+WHERE sc.Inquiry_intID = @InquiryID
+AND sc.OverCounterParentItem IS NULL
+/*
+For Made at Sale Time Items (S), Make sure the Movements are not calculated, and just the actual sales are calculated
+This also applies for Non-Stocktakeable Items
+*/
+-- MP Update 2006/03/21
+-- Consolidated the Update for for Item_strItemType = 'S' and Item_strStocktakeable = 'N' into one statement
+-- Added Wastage as it was not being set to 0
+UPDATE tblStockInquiryConc
+SET 	OpeningQty = 0,
+	OpeningCost = 0,
+	OpeningAverageNettCost = 0,
+	OpeningLastNettCost = 0,
+	OpeningQtyStockUOM1 = 0,
+	ReceivedQty = 0,
+	ReceivedCost = 0,
+	ReceivedAverageNettCost = 0,
+	ReceivedLastNettCost = 0,
+	ReceivedQtyStockUOM1 = 0,
+	TransferExtQty = 0,
+	TransferExtCost = 0,
+	TransferExtAverageNettCost = 0,
+	TransferExtLastNettCost = 0,
+	TransferExtQtyStockUOM1 = 0,
+	TransferIntQty = 0,
+	TransferIntCost = 0,
+	TransferIntAverageNettCost = 0,
+	TransferIntLastNettCost = 0,
+	TransferIntQtyStockUOM1 = 0,
+	AdjustmentsQty = 0,
+	AdjustmentsCost = 0,
+	AdjustmentsAverageNettCost = 0,
+	AdjustmentsLastNettCost = 0,
+	AdjustmentsQtyStockUOM1 = 0,
+	OverCounterQty = 0,
+	OverCounterCost = 0,
+	OverCounterAverageNettCost = 0,
+	OverCounterLastNettCost = 0,
+	OverCounterQtyStockUOM1 = 0,
+	VarianceQty = 0,
+	VarianceCost = 0,
+	VarianceAverageNettCost = 0,
+	VarianceLastNettCost = 0,
+	VarianceQtyStockUOM1 = 0,
+	WastageQty = 0,
+	WastageCost = 0,
+	WastageAverageNettCost = 0,
+	WastageLastNettCost = 0,
+	WastageQtyStockUOM1 = 0
+WHERE	Inquiry_intID = @InquiryID
+AND	(Item_strItemType = 'S'
+OR 	Item_strStocktakeable = 'N')
+/************************************************************************************/
+/* LAST LAST COST and LAST AVERAGE COST					*/
+/*									*/
+/* A change in the thinking of Last Cost and Average Cost. Rather than using the Last Cost and Average 	*/
+/* cost from each transaction line, it should only use the Last Last Cost and Last Average Cost for 	*/
+/* each Item in the Report Period							*/
+/*									*/		
+/*************************************************************************************/
+UPDATE tblStockInquiryConc
+SET 	
+	OpeningAverageNettCost = OpeningQty * ISNULL(Item_decNetAverageCostPreReportPeriod, Item_decNetAverageCost),  -- Use Average Cost from Transaction Prior to period - else use the Average Cost for this Report Period
+	OpeningLastNettCost = OpeningQty * Item_decNetLastCost,
+	
+	--ReceivedAverageNettCost = ReceivedQty * Item_decNetAverageCost ,
+	ReceivedLastNettCost = ReceivedQty * Item_decNetLastCost,
+	
+	--TransferExtAverageNettCost = TransferExtQty * Item_decNetAverageCost ,
+	TransferExtLastNettCost = TransferExtQty * Item_decNetLastCost,
+	
+	--TransferIntAverageNettCost =TransferIntQty * Item_decNetAverageCost ,
+	TransferIntLastNettCost =TransferIntQty * Item_decNetLastCost,
+	
+	--AdjustmentsAverageNettCost = AdjustmentsQty * Item_decNetAverageCost ,
+	AdjustmentsLastNettCost = AdjustmentsQty * Item_decNetLastCost,
+	
+	--OverCounterAverageNettCost = OverCounterQty * Item_decNetAverageCost ,
+	OverCounterLastNettCost = OverCounterQty * Item_decNetLastCost,
+	
+	--VarianceAverageNettCost = VarianceQty * Item_decNetAverageCost ,
+	VarianceLastNettCost = VarianceQty * Item_decNetLastCost,
+	
+	--WastageAverageNettCost = WastageQty * Item_decNetAverageCost ,
+	WastageLastNettCost = WastageQty * Item_decNetLastCost,
+	
+	--ItemsPremadeAverageNettCost = ItemsPremadeQty  * Item_decNetAverageCost,
+	ItemsPremadeLastNettCost = ItemsPremadeQty * Item_decNetLastCost,
+	--CalculatedSalesAverageNettCost = CalculatedSalesQty * Item_decNetAverageCost,
+	CalculatedSalesLastNettCost = CalculatedSalesQty* Item_decNetLastCost,
+	--ClosingAverageNettCost = ClosingQty * Item_decNetAverageCost,
+	ClosingLastNettCost = ClosingQty* Item_decNetLastCost,
+	--StocktakeAdjustAverageNettCost = StocktakeAdjustQty * Item_decNetAverageCost,
+	StocktakeAdjustLastNettCost = StocktakeAdjustQty* Item_decNetLastCost,
+	--TotalStockUsageAverageNettCost = TotalStockUsageQty * Item_decNetAverageCost,
+	TotalStockUsageLastNettCost = TotalStockUsageQty* Item_decNetLastCost,
+	--TotalUsageAverageNettCost = TotalUsageQty * Item_decNetAverageCost,
+	TotalUsageLastNettCost = TotalUsageQty* Item_decNetLastCost,
+	--ActualSalesAverageNettCost = ActualSalesQty * Item_decNetAverageCost,
+	ActualSalesLastNettCost = ActualSalesQty* Item_decNetLastCost
+	
+WHERE	Inquiry_intID = @InquiryID
+SELECT @TotalSales = SUM(ActualSalesNet) FROM tblStockInquiryConc
+WHERE Inquiry_intID = @InquiryID
+-- The total Stock Usage Field is calculated as defined on the Cost Of Sales Report
+UPDATE tblStockInquiryConc																																					
+SET 	TotalStockUsageQty = OverCounterQty + WastageQty + StocktakeAdjustQty + ItemsPremadeQty ,
+	TotalStockUsageCost = OverCounterCost + WastageCost + StocktakeAdjustCost + ItemsPremadeCost,
+	TotalStockUsageAverageNettCost = OverCounterAverageNettCost + WastageAverageNettCost + StocktakeAdjustAverageNettCost + ItemsPremadeAverageNettCost,
+	TotalStockUsageLastNettCost = OverCounterLastNettCost + WastageLastNettCost + StocktakeAdjustLastNettCost + ItemsPremadeLastNettCost,
+	TotalStockUsageQtyStockUOM1 = OverCounterQtyStockUOM1 + WastageQtyStockUOM1 + StocktakeAdjustQtyStockUOM1 + ItemsPremadeQtyStockUOM1
+WHERE Inquiry_intID = @InquiryID
+/* New Logic For Calculating the Closing Quantity 	(27/02/2004 MP)				
+ - If we are in DAYEND Mode and the Closing Date > Now then use the Physical Count Column as the closing Quantity 
+*/
+UPDATE tblStockInquiryConc 
+SET ClosingQty = NULL
+WHERE Inquiry_intID = @InquiryID
+IF (@StocktakeMode = 'DayEnd') AND (@ToDateTime > dbo.GetLocalDate())
+BEGIN
+	UPDATE tblStockInquiryConc
+	SET ClosingQty = ss.Stock_decPhysCount,
+	ClosingCost = ss.Stock_decPhysCount * sc.Item_decNetCostPrice,
+	ClosingQtyStockUOM1 = ss.Stock_decPhysCount/item.Item_curStockUOMConv,
+	ClosingAverageNettCost = ss.Stock_decPhysCount * sc.Item_decNetAverageCost,
+	ClosingLastNettCost = ss.Stock_decPhysCount * sc.Item_decNetLastCost,
+	-- Also need to update the Stocktake Variance Figures
+	StocktakeAdjustQty = StocktakeAdjustQty + ISNULL((ss.Stock_decPhysCount - ss.Stock_curFrozenAvailable),0),
+	StocktakeAdjustCost = StocktakeAdjustCost + ISNULL(((ss.Stock_decPhysCount - ss.Stock_curFrozenAvailable)* sc.Item_decNetCostPrice),0),
+	StocktakeAdjustAverageNettCost = StocktakeAdjustAverageNettCost + ISNULL(((ss.Stock_decPhysCount - ss.Stock_curFrozenAvailable)* sc.Item_decNetAverageCost),0),
+	StocktakeAdjustLastNettCost = StocktakeAdjustLastNettCost + ISNULL(((ss.Stock_decPhysCount - ss.Stock_curFrozenAvailable)* sc.Item_decNetLastCost),0),
+	StocktakeAdjustQtyStockUOM1 = StocktakeAdjustQtyStockUOM1 + ISNULL(((ss.Stock_decPhysCount - ss.Stock_curFrozenAvailable)/item.Item_curStockUOMConv),0)
+	FROM tblStockInquiryConc sc, tblStock_Status ss, tblItem item
+	WHERE ss.Item_strItemId = sc.Item_strCode
+	AND item.Item_strItemId = sc.Item_strCode
+	AND ss.Location_strCode = sc.Location_strCode
+	--AND ss.Stock_decPhysCount IS NOT NULL	
+	AND Inquiry_intID = @InquiryID
+	
+END
+	
+-- Now update the Closing Balance where Closing Quantity is NULL
+UPDATE tblStockInquiryConc
+SET 	ClosingQty = OpeningQty + ReceivedQty + TransferIntQty + TransferExtQty + AdjustmentsQty - TotalStockUsageQty /*+ ItemsPremadeQty */,
+	ClosingCost = OpeningCost + ReceivedCost + TransferIntCost + TransferExtCost + AdjustmentsCost - TotalStockUsageCost /*+ ItemsPremadeCost*/,
+	ClosingAverageNettCost = OpeningAverageNettCost + ReceivedAverageNettCost + TransferIntAverageNettCost + TransferExtAverageNettCost + AdjustmentsAverageNettCost - TotalStockUsageAverageNettCost /*+ ItemsPremadeAverageNettCost*/,
+	ClosingLastNettCost = OpeningLastNettCost + ReceivedLastNettCost + TransferIntLastNettCost + TransferExtLastNettCost + AdjustmentsLastNettCost - TotalStockUsageLastNettCost /*+ ItemsPremadeLastNettCost*/,
+	ClosingQtyStockUOM1 = OpeningQtyStockUOM1 + ReceivedQtyStockUOM1 + TransferIntQtyStockUOM1 + TransferExtQtyStockUOM1 + AdjustmentsQtyStockUOM1 - TotalStockUsageQtyStockUOM1  /*+ ItemsPremadeQtyStockUOM1*/
+WHERE Inquiry_intID = @InquiryID
+AND ClosingQty IS NULL
+-- Calculated Sales (Physical Sales)
+UPDATE tblStockInquiryConc
+SET 	CalculatedSalesQty = ActualSalesQty - VarianceQty,
+	CalculatedSalesCost = ActualSalesCost - VarianceCost,
+	CalculatedSalesAverageNettCost = ActualSalesAverageNettCost - VarianceAverageNettCost,
+	CalculatedSalesLastNettCost = ActualSalesLastNettCost - VarianceLastNettCost,
+	CalculatedSalesQtyStockUOM1 = ActualSalesQtyStockUOM1 - VarianceQtyStockUOM1,
+	CalculatedSalesGross = CASE OverCounterQty WHEN 0 THEN 0 ELSE (OverCounterGross/OverCounterQty)  * (ActualSalesQty - VarianceQty) END,
+	CalculatedSalesNet = CASE OverCounterQty WHEN 0 THEN 0 ELSE (OverCounterNet/OverCounterQty) * (ActualSalesQty - VarianceQty)END,
+	PurchaseCOGS = CASE ActualSalesNet WHEN 0 THEN 0 ELSE (OverCounterCost / ActualSalesNet) * 100 END,
+	OverallCOGS = CASE ActualSalesNet WHEN 0 THEN 0 ELSE (TotalStockUsageCost / ActualSalesNet) * 100 END,
+	SalesMix = CASE @TotalSales WHEN 0 THEN 0 ELSE (ActualSalesNet / @TotalSales) * 100 END
+WHERE Inquiry_intID = @InquiryID
+/********************************************************************************************************************************/
+/*	If CostType Passed in is Average or Last, then move the appropriate Costs into the Standard Cost field			*/
+/*	so existing reports can continue to use this field									*/
+/********************************************************************************************************************************/
+IF @CostType = 'LAST' 
+BEGIN
+	UPDATE tblStockInquiryConc
+	SET 	
+		OpeningCost = OpeningLastNettCost,
+		ReceivedCost = ReceivedLastNettCost,
+		TransferExtCost = TransferExtLastNettCost,
+		TransferIntCost = TransferIntLastNettCost,
+		AdjustmentsCost = AdjustmentsLastNettCost,
+		OverCounterCost = OverCounterLastNettCost,
+		VarianceCost = VarianceLastNettCost,
+		WastageCost = WastageLastNettCost,
+		ItemsPremadeCost = ItemsPremadeLastNettCost,
+		StocktakeAdjustCost = StocktakeAdjustLastNettCost,
+		ActualSalesCost = ActualSalesLastNettCost,
+		CalculatedSalesCost = CalculatedSalesLastNettCost,
+		ClosingCost = ClosingLastNettCost,
+		TotalStockUsageCost = TotalStockUsageLastNettCost,
+		TotalUsageCost = TotalUsageLastNettCost
+	WHERE	Inquiry_intID = @InquiryID
+END
+ELSE IF @CostType = 'AVERAGE' 
+BEGIN
+	UPDATE tblStockInquiryConc
+	SET 	
+		OpeningCost = OpeningAverageNettCost,
+		ReceivedCost = ReceivedAverageNettCost,
+		TransferExtCost = TransferExtAverageNettCost,
+		TransferIntCost = TransferIntAverageNettCost,
+		AdjustmentsCost = AdjustmentsAverageNettCost,
+		OverCounterCost = OverCounterAverageNettCost,
+		VarianceCost = VarianceAverageNettCost,
+		WastageCost = WastageAverageNettCost,
+		ItemsPremadeCost = ItemsPremadeAverageNettCost,
+		StocktakeAdjustCost = StocktakeAdjustAverageNettCost,
+		ActualSalesCost = ActualSalesAverageNettCost,
+		CalculatedSalesCost = CalculatedSalesAverageNettCost,
+		ClosingCost = ClosingAverageNettCost,
+		TotalStockUsageCost = TotalStockUsageAverageNettCost,
+		TotalUsageCost = TotalUsageAverageNettCost
+	WHERE	Inquiry_intID = @InquiryID
+END
+--	B16135 6 October 2009 MTS :: START DELETE
+--	*************************************************************
+--	**********  This change may create future issues.  **********
+--	*************************************************************
+--	On instruction from Mark Pattie, this blanket change has been
+--	removed so "Last Stocktake Date" truly reflects the date of the
+--	last stocktake for the item and location.
+--IF @UseFromDateAsLastStocktakeDate = 'Y' 
+--BEGIN
+--	IF @DebugMode = 'Y'
+--		PRINT '>>>>>>>>>>  OVERWRITE ALL STOCKTAKE DATES WITH @FromDate  <<<<<<<<<<'
+--
+--	UPDATE tblStockInquiryConc
+--	SET LastStocktakeDate = @FromDate
+--	WHERE Inquiry_intID = @InquiryID
+--END
+--	*************************************************************
+--	**********  This change may create future issues.  **********
+--	*************************************************************
+--	B16135 6 October 2009 MTS ::   END DELETE
+drop table #tmpInventory
+-- If in Debug Mode, then Print out Debugging info
+IF @DebugMode = 'Y'
+BEGIN
+	PRINT 'Updating all Stock Movements: ' + CAST(DATEDIFF(ms, @StartTime, dbo.GetLocalDate()) as VarChar(30)) + ' ms'
+	SET @StartTime = dbo.GetLocalDate()
+END
+-- Revert back to normal locking behaviour
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
