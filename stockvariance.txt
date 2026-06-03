@@ -1,3 +1,5 @@
+
+
 USE [VISTA]
 GO
 /****** Object:  StoredProcedure [dbo].[spStockInquiryConc]    Script Date: 5/30/2026 12:31:06 AM ******/
